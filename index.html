@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0b0f17" />
+  <meta name="description" content="PWA dimostrativa: sensori dello smartphone per movimento, presenza, respiro, battito e cadute. Tutto on-device." />
+
+  <!-- iOS / Safari PWA -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Motion Sense Lab" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icons/icon-192.png" type="image/png" />
+  <link rel="stylesheet" href="css/style.css" />
+
+  <title>Motion Sense Lab — I sensori che hai già in tasca</title>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◉</span>
+      <div>
+        <h1>Motion Sense Lab</h1>
+        <p class="subtitle">I sensori che hai già in tasca.</p>
+      </div>
+    </div>
+    <button id="installBtn" class="ghost hidden" type="button" aria-label="Installa app">Installa</button>
+  </header>
+
+  <main id="view" class="view" aria-live="polite">
+    <!-- I moduli vengono iniettati qui dal router -->
+  </main>
+
+  <nav class="tabbar" aria-label="Navigazione principale">
+    <a href="#home" class="tab" data-route="home">
+      <span class="tab-ico">⌂</span><span class="tab-lbl">Home</span>
+    </a>
+    <a href="#movement" class="tab" data-route="movement">
+      <span class="tab-ico">↻</span><span class="tab-lbl">Movimento</span>
+    </a>
+    <a href="#fall" class="tab" data-route="fall">
+      <span class="tab-ico">!</span><span class="tab-lbl">Caduta</span>
+    </a>
+    <a href="#steps" class="tab" data-route="steps">
+      <span class="tab-ico">≋</span><span class="tab-lbl">Passi</span>
+    </a>
+    <a href="#sound" class="tab" data-route="sound">
+      <span class="tab-ico">♪</span><span class="tab-lbl">Audio</span>
+    </a>
+    <a href="#heart" class="tab" data-route="heart">
+      <span class="tab-ico">♥</span><span class="tab-lbl">Battito</span>
+    </a>
+    <a href="#breath" class="tab" data-route="breath">
+      <span class="tab-ico">∿</span><span class="tab-lbl">Respiro</span>
+    </a>
+    <a href="#info" class="tab" data-route="info">
+      <span class="tab-ico">i</span><span class="tab-lbl">Info</span>
+    </a>
+  </nav>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
