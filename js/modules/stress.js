@@ -53,8 +53,14 @@ export function mount(container) {
 
   const startBtn = el('button', { class: 'btn', type: 'button' }, 'Attiva fotocamera');
   const stopBtn  = el('button', { class: 'btn secondary', type: 'button', disabled: true }, 'Stop');
+  // Toggle torcia: visibile solo se la fotocamera espone 'torch' (vedi onTorch).
+  const torchBtn = el('button', { class: 'btn ghost hidden', type: 'button' }, '🔦 Torcia');
+  const torchHint = el('p', { class: 'muted hidden', style: 'font-size:12px;margin-top:8px' },
+    'Torcia non disponibile su questo dispositivo (iPhone con iOS ≤16 o fotocamera senza flash): per un HRV affidabile servono buona luce ambientale e dito fermo.');
   const controls = el('div', { class: 'card' },
     el('div', { class: 'btn-row' }, startBtn, stopBtn),
+    el('div', { style: 'margin-top:10px' }, torchBtn),
+    torchHint,
     el('div', { class: 'kv', style: 'margin-top:12px' },
       el('dt', {}, 'Stato'),   el('dd', { id: 'stStatus' }, '—'),
       el('dt', {}, 'Qualità'), el('dd', { id: 'stQual' },   '—'),
@@ -167,11 +173,30 @@ export function mount(container) {
     }
   }
 
+  // Stato torcia → toggle visibile solo dove 'torch' è esposto, altrimenti avviso.
+  function onTorch({ available, on }) {
+    if (available) {
+      torchHint.classList.add('hidden');
+      torchBtn.classList.remove('hidden');
+      torchBtn.classList.toggle('ok', on);
+      torchBtn.textContent = on ? '🔦 Torcia accesa — tocca per spegnere' : '🔦 Accendi torcia';
+    } else {
+      torchBtn.classList.add('hidden');
+      torchHint.classList.remove('hidden');
+    }
+  }
+
+  function resetTorchUI() {
+    torchBtn.classList.add('hidden');
+    torchBtn.classList.remove('ok');
+    torchHint.classList.add('hidden');
+  }
+
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
     rr.length = 0; prevInRange = 0; lastStress = null;
     setText('#stRmssd', '—'); setText('#stSdnn', '—'); setText('#stCount', '0');
-    capture = new PpgCapture(onSample);
+    capture = new PpgCapture(onSample, onTorch);
     try {
       await capture.start();
     } catch (err) {
@@ -188,6 +213,7 @@ export function mount(container) {
   function stop() {
     if (capture) { capture.stop(); capture = null; }
     gaugeBox.classList.remove('scanning');
+    resetTorchUI();
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('fermo', '');
@@ -197,6 +223,7 @@ export function mount(container) {
 
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
+  torchBtn.addEventListener('click', () => { if (capture) capture.setTorch(!capture.torchOn); });
 
   return { unmount() { stop(); } };
 }
