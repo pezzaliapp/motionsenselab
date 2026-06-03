@@ -6,7 +6,7 @@
 // duplicarla. La pipeline è invariata rispetto a heart.js:
 //   1) video → drawImage su canvas off-screen 160×120
 //   2) media del canale rosso su ROI centrale 80×80
-//   3) passa-banda 0.7–4 Hz (42–240 bpm)
+//   3) passa-banda 0.9–4 Hz (≈54–240 bpm)
 //   4) peak detector adattivo (refrattarietà 300 ms + isteresi) → RR (≈battiti)
 //   5) stima di qualità grossolana (ampiezza del filtrato)
 //
@@ -51,9 +51,14 @@ export class PpgCapture {
     this.torchOn = false;
     this._torchTimer = null;
 
-    // Banda PPG 0.7–4 Hz; refrattarietà 300 ms ≈ max 200 bpm + isteresi
+    // Banda PPG 0.9–4 Hz; refrattarietà 300 ms ≈ max 200 bpm + isteresi
     // (vedi PeakDetector): un picco per ciclo, niente doppio conteggio dicrota.
-    this.bp = new BandPass(0.7, 4.0);
+    // High-pass alzato 0.7→0.9 Hz: attenua la deriva lenta (respiro/movimento,
+    // ondulazioni ~1 Hz) che sollevava la baseline e faceva perdere battiti.
+    // Pavimento ~0.9 Hz ≈ 54 bpm: la componente cardiaca sotto i 54 bpm viene
+    // attenuata — accettabile per misure a riposo (a riposo si sta sopra),
+    // sotto i 54 bpm il bpm va considerato inaffidabile.
+    this.bp = new BandPass(0.9, 4.0);
     this.peaks = new PeakDetector({ minIntervalMs: 300, k: 0.5 });
     this.filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
     this.quality = 0;

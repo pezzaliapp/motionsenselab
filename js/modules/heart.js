@@ -11,7 +11,7 @@
 // Pipeline implementata:
 //   1) videoElement → drawImage su canvas off-screen (160×120, riduce CPU)
 //   2) per ogni frame, media del canale rosso su una ROI centrale
-//   3) filtro passa-banda 0.7 Hz – 4 Hz (42–240 bpm)
+//   3) filtro passa-banda 0.9 Hz – 4 Hz (≈54–240 bpm)
 //   4) peak detector adattivo → battiti
 //   5) RateEstimator (mediana mobile su 8 intervalli) → bpm stabile
 //
@@ -35,7 +35,7 @@ export function mount(container) {
   // ---- UI ----
   const intro = el('div', { class: 'card' },
     el('h2', {}, 'Battito cardiaco (PPG)'),
-    el('p', {}, "Appoggia delicatamente il polpastrello dell'indice sulla fotocamera posteriore. Tieni fermo per circa 20 secondi. L'app analizza la luminosità del canale rosso, isola la componente cardiaca (0.7–4 Hz) e conta i picchi."),
+    el('p', {}, "Appoggia delicatamente il polpastrello dell'indice sulla fotocamera posteriore. Tieni fermo per circa 20 secondi. L'app analizza la luminosità del canale rosso, isola la componente cardiaca (0.9–4 Hz) e conta i picchi."),
     el('div', { class: 'warning' },
       el('strong', {}, 'Misurazione indicativa, non uso medico. '),
       "Usa un cardiofrequenzimetro o un saturimetro per misure affidabili. Su iPhone (iOS 17+) l'app può accendere la torcia per un segnale più pulito; dove non è disponibile servono buona luce ambientale e dito fermo."
