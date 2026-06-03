@@ -80,8 +80,9 @@ export function mount(container) {
   container.appendChild(controls);
   container.appendChild(gaugeCard);
 
-  // Disegno iniziale (gauge vuoto → "—").
-  drawGauge(gaugeCanvas, NaN, { label: 'Stress', unit: '/100' });
+  // Disegno iniziale (gauge vuoto → "—"). Al frame successivo, così il canvas
+  // ha già la larghezza di layout.
+  requestAnimationFrame(() => drawGauge(gaugeCanvas, NaN, { label: 'Stress', unit: '/100' }));
 
   // ---- helpers ----
   function setBadge(sel, label, cls) {
