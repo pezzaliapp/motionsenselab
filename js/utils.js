@@ -248,12 +248,6 @@ export class PeakDetector {
 
     // 5) ri-armatura sull'avvallamento
     if (norm < this.reArm) this.armed = true;
-    // Safety net anti-blocco: su alcuni device l'onda normalizzata può non
-    // scendere mai sotto `reArm` (forma asimmetrica/clippata); senza questa
-    // rete il rilevatore resterebbe disarmato dopo il primo picco → bpm fermo
-    // su "—". Se è passato troppo tempo dall'ultimo picco, ri-arma comunque.
-    // Dormiente in funzionamento normale (RR < 1500 ms ⇒ ri-arma prima via reArm).
-    if (!this.armed && this.lastPeakTs && (ts - this.lastPeakTs) > 1500) this.armed = true;
 
     let isPeak = false, intervalMs = 0;
     if (

@@ -12,8 +12,9 @@
 //   1) videoElement → drawImage su canvas off-screen (160×120, riduce CPU)
 //   2) per ogni frame, media del canale rosso su una ROI centrale
 //   3) filtro passa-banda 0.9 Hz – 4 Hz (≈54–240 bpm)
-//   4) peak detector adattivo → battiti
-//   5) RateEstimator (mediana mobile su 8 intervalli) → bpm stabile
+//   4) peak detector normalizzato → battiti (intervalli RR)
+//   5) filtro outlier sugli RR + mediana mobile + gate di coerenza e smoothing
+//      → bpm stabile (mostrato solo se gli ultimi battiti sono consistenti)
 //
 // Limiti dichiarati:
 //   - torcia non accessibile da PWA su iOS: serve buona luce ambientale,
@@ -21,7 +22,7 @@
 //   - mantenere il dito FERMO è essenziale: rumore di movimento >> segnale PPG.
 // ============================================================================
 
-import { el, RateEstimator, drawTrace } from '../utils.js';
+import { el, drawTrace } from '../utils.js';
 import { PpgCapture } from '../ppg.js';
 import { setMetric } from '../store.js';
 
@@ -30,7 +31,23 @@ export function mount(container) {
   // e condivisa con il modulo Stress. Qui consumiamo i campioni per stimare i bpm.
   let capture = null;
 
-  const rate = new RateEstimator(8);
+  // Stima bpm robusta: gli intervalli RR passano un filtro outlier (range
+  // fisiologico + scarto dei salti bruschi da sfarfallio del dito / doppi
+  // conteggi), poi mediana su finestra mobile. Il numero si mostra solo quando
+  // gli ultimi battiti sono COERENTI (segnale davvero periodico) ed è smussato,
+  // così non salta 120→75→35. Altrimenti "—" (onesto: sta ancora misurando).
+  const recentRR = [];     // ultimi intervalli RR validi (ms)
+  let dispBpm = 0;         // bpm visualizzato, smussato (EMA)
+  const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+  function pushRR(v) {
+    if (v < 333 || v > 1500) return;                 // fuori 40–180 bpm
+    if (recentRR.length >= 3) {
+      const m = median(recentRR);
+      if (Math.abs(v - m) / m > 0.30) return;        // scarta l'outlier (flicker/doppio conteggio)
+    }
+    recentRR.push(v);
+    if (recentRR.length > 8) recentRR.shift();
+  }
 
   // ---- UI ----
   const intro = el('div', { class: 'card' },
@@ -94,20 +111,31 @@ export function mount(container) {
 
   // ---- Consumo dei campioni PPG ----
   // Per ogni frame aggiorniamo l'indicatore "dito/luce" e, sui picchi validi,
-  // alimentiamo il RateEstimator. Il rendering del grafico e dei bpm avviene qui.
+  // alimentiamo il buffer RR filtrato. Il rendering del grafico e dei bpm qui.
   function onSample(s) {
     setBadge('#hLight', s.fingerOk ? 'dito rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
 
-    if (s.fingerOk && s.isPeak && s.intervalMs > 0) rate.push(s.intervalMs);
+    if (s.fingerOk && s.isPeak && s.intervalMs > 0) pushRR(s.intervalMs);
+    // Dito assente per davvero: butta la storia, così al rientro si riparte pulito.
+    if (!s.fingerOk) { recentRR.length = 0; dispBpm = 0; }
 
     drawTrace(canvas, capture.filtered(), { color: '#ff5b6e' });
-    // Mostra un numero quando il dito è presente e il bpm è fisiologico. Niente
-    // gate sull'ampiezza assoluta: il rilevatore lavora sul segnale NORMALIZZATO
-    // (vedi PeakDetector.envelope) e l'ampiezza grezza del PPG dal vivo varia
-    // troppo da device a device per fissarci una soglia. Senza dito → "—".
-    const bpm = rate.perMinute();
-    const reliable = s.fingerOk && bpm >= 40 && bpm <= 200;
-    setText('#hBpm', reliable ? Math.round(bpm).toString() : '—');
+
+    // Mostra il numero solo con abbastanza battiti COERENTI tra loro (segnale
+    // periodico): mediana + dispersione bassa. Altrimenti "—" (sta misurando).
+    let shown = '—';
+    if (s.fingerOk && recentRR.length >= 5) {
+      const m = median(recentRR);
+      const spread = (Math.max(...recentRR) - Math.min(...recentRR)) / m;
+      const bpm = 60000 / m;
+      if (spread < 0.35 && bpm >= 40 && bpm <= 200) {
+        dispBpm = dispBpm ? dispBpm * 0.8 + bpm * 0.2 : bpm;   // smoothing
+        shown = Math.round(dispBpm).toString();
+      } else if (dispBpm) {
+        shown = Math.round(dispBpm).toString();                // tieni l'ultimo stabile
+      }
+    }
+    setText('#hBpm', shown);
 
     let qLbl, qCls;
     if (!s.fingerOk)            { qLbl = 'in attesa'; qCls = ''; }
@@ -139,7 +167,8 @@ export function mount(container) {
 
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
-    rate.reset();
+    recentRR.length = 0; dispBpm = 0;
+    setText('#hBpm', '—');
     capture = new PpgCapture(onSample, onTorch);
     try {
       await capture.start();
@@ -159,9 +188,8 @@ export function mount(container) {
     stopBtn.disabled = true;
     resetTorchUI();
     setStatus('fermo', '');
-    // Salva l'ultimo bpm per gli anelli salute della Home.
-    const bpm = rate.perMinute();
-    if (bpm > 0) setMetric('hr', Math.round(bpm), 'bpm');
+    // Salva l'ultimo bpm STABILE per gli anelli salute della Home.
+    if (dispBpm > 0) setMetric('hr', Math.round(dispBpm), 'bpm');
   }
 
   startBtn.addEventListener('click', start);

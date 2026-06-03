@@ -56,10 +56,10 @@ export class PpgCapture {
     this.torchOn = false;
     this._torchTimer = null;
 
-    // Lente + constraints PPG (vedi start / _maybeSwitchToUltraWide /
-    // _applyPpgConstraints): su iPhone la lente giusta per il contatto è
-    // l'ULTRA-GRANDANGOLO posteriore (fuoco ravvicinato), e l'AWB va bloccato.
-    this.lensSwitched = false;          // true se abbiamo ri-aperto l'ultra-wide
+    // Constraints PPG (vedi _applyPpgConstraints): sulla fotocamera posteriore
+    // di default blocchiamo l'AWB e proviamo il fuoco ravvicinato. NON cambiamo
+    // lente: la principale è co-locata con la torcia (vedi start).
+    this.lensSwitched = false;          // mantenuto per la sonda diagnostica (sempre false ora)
     this.ppgConstraintsApplied = null;  // { whiteBalanceMode?, focusDistance?, ... }
     this._ppgConstraintsTimer = null;
 
@@ -92,12 +92,11 @@ export class PpgCapture {
     this.stream = await requestCamera();   // può rilanciare: gestito dal chiamante
     this.track = this.stream.getVideoTracks()[0] || null;
 
-    // Lente giusta per il PPG a contatto: l'ULTRA-GRANDANGOLO posteriore ha
-    // fuoco ravvicinato, mentre la wide/tele standard col dito a contatto
-    // (focusDistance min ~0.02) è quasi sempre fuori fuoco. enumerateDevices
-    // espone le label solo DOPO il primo getUserMedia (permesso appena
-    // concesso qui sopra), quindi solo ora possiamo individuarla e ri-aprirla.
-    await this._maybeSwitchToUltraWide();
+    // NB: usiamo la fotocamera posteriore di DEFAULT (la principale), che su
+    // iPhone è co-locata con il LED/torcia: col dito a contatto è quella
+    // illuminata correttamente. NON forziamo l'ultra-grandangolo: su 15 Pro Max
+    // è lontano dalla torcia → dito mal illuminato, rilevamento intermittente e
+    // segnale pessimo (regressione osservata sul device).
 
     const video = document.createElement('video');
     video.playsInline = true;
@@ -134,41 +133,6 @@ export class PpgCapture {
 
     // Sonda diagnostica read-only (solo se richiesta dal consumatore).
     if (this.onDiag) this._collectDiagnostics();
-  }
-
-  // Cerca la lente ultra-grandangolo posteriore tra le camere esposte e, se
-  // trovata e diversa da quella attuale, ri-apre lo stream su quel deviceId.
-  // Fallback onesto: se non c'è o getUserMedia la rifiuta, resta sulla lente
-  // corrente. Usa getUserMedia diretto (non requestCamera) per non sporcare lo
-  // stato 'camera' dei permessi in caso di rifiuto non fatale.
-  async _maybeSwitchToUltraWide() {
-    let devs = [];
-    try { devs = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
-    const uw = devs.find(d =>
-      d.kind === 'videoinput' && d.deviceId &&
-      /ultra|grandangol/i.test(d.label) &&
-      /posterior|back|rear|environment/i.test(d.label));
-    if (!uw) return;                                    // niente ultra-wide: resta com'è
-    let cur = null;
-    try { cur = this.track && this.track.getSettings ? this.track.getSettings().deviceId : null; } catch {}
-    if (cur && cur === uw.deviceId) return;             // già su quella lente
-    try {
-      const newStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          deviceId: { exact: uw.deviceId },
-          width:  { ideal: 320 },
-          height: { ideal: 240 },
-          frameRate: { ideal: 30, max: 30 },
-        },
-      });
-      for (const t of this.stream.getTracks()) t.stop();   // chiudi la vecchia lente
-      this.stream = newStream;
-      this.track = newStream.getVideoTracks()[0] || this.track;
-      this.lensSwitched = true;
-    } catch {
-      // rifiutata: teniamo lo stream attuale (fallback onesto)
-    }
   }
 
   // Applica i constraint utili al PPG: blocca l'AWB su 'manual' (congela il
@@ -328,14 +292,16 @@ export class PpgCapture {
 
       let isPeak = false, intervalMs = 0;
       if (fingerOk) {
+        // Se c'era stato un buco (anche 1 frame), riparti pulito: altrimenti il
+        // primo picco dopo il buco darebbe un intervallo = tutta la pausa → RR
+        // spurio enorme che falsa il bpm. Su un contatto stabile fingerLost
+        // resta 0 e non si resetta mai.
+        if (this.fingerLost > 0) this.peaks.reset();
         this.fingerLost = 0;
         const r = this.peaks.step(filt, now);
         isPeak = r.isPeak; intervalMs = r.intervalMs;
       } else {
-        // Non resettare il rilevatore a ogni singolo frame "no dito": un drop-out
-        // transitorio (1–2 frame) azzererebbe inviluppo e ritmo. Reset solo dopo
-        // una perdita SOSTENUTA (~0.7 s).
-        if (++this.fingerLost > 20) this.peaks.reset();
+        this.fingerLost++;
       }
 
       if (this.onSample) {
