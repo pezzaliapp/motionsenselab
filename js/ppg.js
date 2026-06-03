@@ -7,7 +7,7 @@
 //   1) video → drawImage su canvas off-screen 160×120
 //   2) media del canale rosso su ROI centrale 80×80
 //   3) passa-banda 0.7–4 Hz (42–240 bpm)
-//   4) peak detector adattivo (refrattarietà 280 ms) → intervalli battito (≈RR)
+//   4) peak detector adattivo (refrattarietà 300 ms + isteresi) → RR (≈battiti)
 //   5) stima di qualità grossolana (ampiezza del filtrato)
 //
 // Il consumatore riceve, per ogni frame, un oggetto sample con il risultato
@@ -51,9 +51,10 @@ export class PpgCapture {
     this.torchOn = false;
     this._torchTimer = null;
 
-    // Banda PPG 0.7–4 Hz; refrattarietà 280 ms ≈ max 214 bpm.
+    // Banda PPG 0.7–4 Hz; refrattarietà 300 ms ≈ max 200 bpm + isteresi
+    // (vedi PeakDetector): un picco per ciclo, niente doppio conteggio dicrota.
     this.bp = new BandPass(0.7, 4.0);
-    this.peaks = new PeakDetector({ minIntervalMs: 280, k: 0.5 });
+    this.peaks = new PeakDetector({ minIntervalMs: 300, k: 0.5 });
     this.filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
     this.quality = 0;
   }

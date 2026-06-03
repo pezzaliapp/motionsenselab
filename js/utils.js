@@ -126,17 +126,24 @@ export class BandPass {
 //     superiore a una soglia adattativa (es. media + k * std finestrata)
 //     e quando dall'ultimo picco è passato almeno `minIntervalMs`.
 //   - minIntervalMs serve a evitare doppi conteggi (refrattarietà):
-//       60 bpm → 1000 ms, 240 bpm → 250 ms → per PPG usiamo ~250 ms.
+//       60 bpm → 1000 ms, 240 bpm → 250 ms → per PPG usiamo ~300 ms (≈200 bpm).
+//   - ISTERESI: dopo un picco il rilevatore si "disarma" e si ri-arma solo
+//     quando il segnale ridiscende sotto la media (baseline). Garantisce UN
+//     picco per ciclo cardiaco: l'incisura dicrota (secondo picco fisiologico
+//     ~250–400 ms dopo la sistole) e i bozzi di rumore che restano sopra la
+//     baseline NON vengono più contati come battiti separati. È la difesa
+//     principale contro l'RMSSD gonfiato da doppio conteggio.
 //   - L'output è { isPeak, intervalMs } da consumare al chiamante.
 // ---------------------------------------------------------------------------
 export class PeakDetector {
-  constructor({ minIntervalMs = 250, k = 0.6 } = {}) {
+  constructor({ minIntervalMs = 300, k = 0.6 } = {}) {
     this.minIntervalMs = minIntervalMs;
     this.k = k;
     this.lastPeakTs = 0;
     this.prevValue = -Infinity;
     this.prevPrev = -Infinity;
     this.window = new RingBuffer(64);
+    this.armed = true; // pronto a rilevare un nuovo picco (isteresi)
   }
   step(value, ts) {
     this.window.push(value);
@@ -147,10 +154,15 @@ export class PeakDetector {
     let isPeak = false;
     let intervalMs = 0;
 
+    // Ri-arma quando il segnale torna sotto la baseline: serve un attraversamento
+    // verso il basso prima di accettare il prossimo picco → un picco per ciclo.
+    if (value < mean) this.armed = true;
+
     // Massimo locale: il campione precedente è maggiore di quello prima e di
     // quello dopo (i.e. value, che ora è "il dopo"). Quindi controlliamo
     // se prevValue > prevPrev && prevValue > value e prevValue > threshold.
     if (
+      this.armed &&
       this.prevValue > this.prevPrev &&
       this.prevValue > value &&
       this.prevValue > threshold
@@ -160,6 +172,7 @@ export class PeakDetector {
         isPeak = true;
         intervalMs = this.lastPeakTs === 0 ? 0 : dt;
         this.lastPeakTs = ts;
+        this.armed = false; // disarma fino al prossimo ritorno sotto baseline
       }
     }
     this.prevPrev = this.prevValue;
@@ -171,6 +184,7 @@ export class PeakDetector {
     this.prevValue = -Infinity;
     this.prevPrev = -Infinity;
     this.window.clear();
+    this.armed = true;
   }
 }
 
