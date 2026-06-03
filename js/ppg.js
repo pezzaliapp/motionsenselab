@@ -63,17 +63,24 @@ export class PpgCapture {
     this.ppgConstraintsApplied = null;  // { whiteBalanceMode?, focusDistance?, ... }
     this._ppgConstraintsTimer = null;
 
-    // Banda PPG 0.9–4 Hz; refrattarietà 300 ms ≈ max 200 bpm + isteresi
-    // (vedi PeakDetector): un picco per ciclo, niente doppio conteggio dicrota.
-    // High-pass alzato 0.7→0.9 Hz: attenua la deriva lenta (respiro/movimento,
-    // ondulazioni ~1 Hz) che sollevava la baseline e faceva perdere battiti.
-    // Pavimento ~0.9 Hz ≈ 54 bpm: la componente cardiaca sotto i 54 bpm viene
-    // attenuata — accettabile per misure a riposo (a riposo si sta sopra),
-    // sotto i 54 bpm il bpm va considerato inaffidabile.
+    // Banda PPG 0.9–4 Hz. Pavimento ~0.9 Hz ≈ 54 bpm: attenua la deriva lenta
+    // (respiro/movimento) che sollevava la baseline; sotto i 54 bpm il bpm va
+    // considerato inaffidabile (accettabile, a riposo si sta sopra).
     this.bp = new BandPass(0.9, 4.0);
-    this.peaks = new PeakDetector({ minIntervalMs: 300, k: 0.5 });
+    // Rilevatore picchi NORMALIZZATO (vedi PeakDetector.envelope): il segnale
+    // viene diviso per un inviluppo lento della sua ampiezza, così ogni battito
+    // — grande o piccolo — diventa ~unitario e una soglia fissa li prende tutti.
+    // Risolve il bpm dimezzato (42–46 invece di ~85) causato dall'ampiezza che
+    // varia battito-battito (AGC/respiro). Parametri validati in simulazione su
+    // 60–115 bpm con AGC 2:1, deriva, dicrota e rumore lieve. Refrattarietà
+    // 350 ms ≈ max 170 bpm: margine pieno fino a 110 bpm, no doppio conteggio.
+    this.peaks = new PeakDetector({
+      minIntervalMs: 350,
+      envelope: { thr: 0.5, reArm: -0.25, aEnv: 0.04, minEnv: 0.08, aSmooth: 0.5 },
+    });
     this.filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
     this.quality = 0;
+    this.fingerLost = 0;   // frame consecutivi senza dito (per la resettatura ritardata)
   }
 
   // Buffer del segnale filtrato (per il grafico live nel consumatore).
@@ -105,7 +112,7 @@ export class PpgCapture {
     this.offCtx = this.off.getContext('2d', { willReadFrequently: true });
 
     this.bp.reset(); this.peaks.reset(); this.filtBuf.clear();
-    this.lastTs = 0; this.quality = 0;
+    this.lastTs = 0; this.quality = 0; this.fingerLost = 0;
     this.active = true;
     this.rafId = requestAnimationFrame(() => this._loop());
 
@@ -298,8 +305,10 @@ export class PpgCapture {
       const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
       const satPct = satCount / n;       // 0..1: frazione della ROI col rosso saturo
 
-      // Dito ben appoggiato: il rosso domina su verde/blu.
-      const fingerOk = meanR > 60 && meanR > meanG * 1.2 && meanR > meanB * 1.2;
+      // Dito ben appoggiato: il rosso domina su verde/blu. Soglie un filo più
+      // permissive (1.15 invece di 1.2) per ridurre i drop-out spuri quando la
+      // torcia illumina molto la pelle.
+      const fingerOk = meanR > 55 && meanR > meanG * 1.15 && meanR > meanB * 1.15;
 
       const now = performance.now();
       const dt = this.lastTs ? (now - this.lastTs) / 1000 : 1 / SAMPLE_HZ;
@@ -319,10 +328,14 @@ export class PpgCapture {
 
       let isPeak = false, intervalMs = 0;
       if (fingerOk) {
+        this.fingerLost = 0;
         const r = this.peaks.step(filt, now);
         isPeak = r.isPeak; intervalMs = r.intervalMs;
       } else {
-        this.peaks.reset();
+        // Non resettare il rilevatore a ogni singolo frame "no dito": un drop-out
+        // transitorio (1–2 frame) azzererebbe inviluppo e ritmo. Reset solo dopo
+        // una perdita SOSTENUTA (~0.7 s).
+        if (++this.fingerLost > 20) this.peaks.reset();
       }
 
       if (this.onSample) {

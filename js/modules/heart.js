@@ -135,8 +135,12 @@ export function mount(container) {
     if (s.fingerOk && s.isPeak && s.intervalMs > 0) rate.push(s.intervalMs);
 
     drawTrace(canvas, capture.filtered(), { color: '#ff5b6e' });
+    // Mostra un numero solo se affidabile: dito presente, segnale con ampiezza
+    // sufficiente e bpm fisiologico. Altrimenti "—" (onestà: niente numeri su
+    // rumore o segnale assente).
     const bpm = rate.perMinute();
-    setText('#hBpm', bpm > 0 ? Math.round(bpm).toString() : '—');
+    const reliable = s.fingerOk && s.quality >= 0.15 && bpm >= 40 && bpm <= 200;
+    setText('#hBpm', reliable ? Math.round(bpm).toString() : '—');
 
     let qLbl, qCls;
     if (!s.fingerOk)            { qLbl = 'in attesa'; qCls = ''; }

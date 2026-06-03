@@ -143,9 +143,19 @@ export class BandPass {
 //   - L'output è { isPeak, intervalMs } da consumare al chiamante.
 // ---------------------------------------------------------------------------
 export class PeakDetector {
-  constructor({ minIntervalMs = 300, k = 0.6 } = {}) {
+  // Opzione `envelope` (opt-in, default null = comportamento storico std-based):
+  // quando valorizzata abilita il rilevamento NORMALIZZATO per il PPG, dove
+  // l'ampiezza dei battiti varia molto (AGC/respiro). Una soglia ∝ std si
+  // auto-alza dopo un battito forte e fa perdere il successivo → bpm dimezzato
+  // (il bug 42–46 invece di ~85). Qui invece il segnale viene diviso per un
+  // inviluppo lento della sua ampiezza: ogni battito (grande o piccolo) diventa
+  // ~unitario e una soglia FISSA li prende tutti. Validato in simulazione su
+  // 60–115 bpm con AGC 2:1, deriva respiratoria, dicrota e rumore lieve.
+  // Parametri envelope: { thr, reArm, aEnv, minEnv, aSmooth }.
+  constructor({ minIntervalMs = 300, k = 0.6, envelope = null } = {}) {
     this.minIntervalMs = minIntervalMs;
     this.k = k;
+    this.envelope = envelope;
     this.lastPeakTs = 0;
     this.prevValue = -Infinity;
     this.prevPrev = -Infinity;
@@ -153,8 +163,22 @@ export class PeakDetector {
     this.armed = true; // pronto a rilevare un nuovo picco (isteresi)
     this.lastPeakValue = null; // valore dell'ultimo picco accettato (per la ri-armatura relativa)
     this.reArmFrac = 0.5;      // frazione della discesa picco→baseline che ri-arma
+    // Stato/parametri della modalità "envelope" (normalizzata).
+    const e = envelope || {};
+    this.thr     = e.thr     != null ? e.thr     : 0.5;   // soglia sul segnale normalizzato
+    this.reArm   = e.reArm   != null ? e.reArm   : -0.25; // livello (negativo) che ri-arma
+    this.aEnv    = e.aEnv    != null ? e.aEnv    : 0.04;  // EMA dell'inviluppo di ampiezza
+    this.minEnv  = e.minEnv  != null ? e.minEnv  : 0.08;  // pavimento inviluppo (anti /0)
+    this.aSmooth = e.aSmooth != null ? e.aSmooth : 0.5;   // pre-smoothing anti-rumore
+    this.sm = 0; this.smInit = false;
+    this.envMag = 0;           // inviluppo (EMA) dell'ampiezza |segnale−baseline|
+    this.base = 0;             // baseline lenta (DC residuo, ~0 dopo l'high-pass)
+    this.baseInit = false;
+    this.pn = -Infinity;       // valore normalizzato precedente (per il massimo locale)
+    this.ppn = -Infinity;
   }
   step(value, ts) {
+    if (this.envelope) return this._stepEnvelope(value, ts);
     this.window.push(value);
     const mean = this.window.mean();
     const std = this.window.std();
@@ -194,6 +218,57 @@ export class PeakDetector {
     this.prevValue = value;
     return { isPeak, intervalMs };
   }
+
+  // Rilevamento NORMALIZZATO (per il PPG). Pipeline per campione:
+  //   1) pre-smoothing EMA (taglia il rumore ad alta freq, tiene la pulsazione)
+  //   2) baseline lenta (~3 s) per immunità alla deriva residua
+  //   3) inviluppo EMA dell'ampiezza |segnale−baseline|
+  //   4) norm = (segnale−baseline)/inviluppo  → ~unitario per OGNI battito
+  //   5) massimo locale di norm sopra una soglia FISSA, refrattarietà, e
+  //      ri-armatura quando norm scende sotto `reArm` (vero avvallamento) →
+  //      un picco per battito, immune all'ampiezza che cambia battito-battito
+  //      e all'incisura dicrota (resta sotto soglia / non ri-arma).
+  _stepEnvelope(value, ts) {
+    // 1) pre-smoothing
+    if (!this.smInit) { this.sm = value; this.smInit = true; }
+    else this.sm += this.aSmooth * (value - this.sm);
+    const v = this.sm;
+
+    // 2) baseline lenta
+    if (!this.baseInit) { this.base = v; this.baseInit = true; }
+    else this.base += 0.01 * (v - this.base);
+
+    // 3) inviluppo dell'ampiezza (EMA, lagga: il picco lo supera → forma preservata)
+    const dev = v - this.base;
+    this.envMag += this.aEnv * (Math.abs(dev) - this.envMag);
+    const env = Math.max(this.envMag, this.minEnv);
+
+    // 4) normalizzazione
+    const norm = dev / env;
+
+    // 5) ri-armatura sull'avvallamento
+    if (norm < this.reArm) this.armed = true;
+
+    let isPeak = false, intervalMs = 0;
+    if (
+      this.armed &&
+      this.pn > this.ppn &&
+      this.pn >= norm &&
+      this.pn > this.thr
+    ) {
+      const dt = ts - this.lastPeakTs;
+      if (dt >= this.minIntervalMs) {
+        isPeak = true;
+        intervalMs = this.lastPeakTs === 0 ? 0 : dt;
+        this.lastPeakTs = ts;
+        this.armed = false;
+      }
+    }
+    this.ppn = this.pn;
+    this.pn = norm;
+    return { isPeak, intervalMs };
+  }
+
   reset() {
     this.lastPeakTs = 0;
     this.prevValue = -Infinity;
@@ -201,6 +276,12 @@ export class PeakDetector {
     this.window.clear();
     this.armed = true;
     this.lastPeakValue = null;
+    this.sm = 0; this.smInit = false;
+    this.envMag = 0;
+    this.base = 0;
+    this.baseInit = false;
+    this.pn = -Infinity;
+    this.ppn = -Infinity;
   }
 }
 
