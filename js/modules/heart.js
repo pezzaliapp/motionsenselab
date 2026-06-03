@@ -38,14 +38,20 @@ export function mount(container) {
     el('p', {}, "Appoggia delicatamente il polpastrello dell'indice sulla fotocamera posteriore. Tieni fermo per circa 20 secondi. L'app analizza la luminosità del canale rosso, isola la componente cardiaca (0.7–4 Hz) e conta i picchi."),
     el('div', { class: 'warning' },
       el('strong', {}, 'Misurazione indicativa, non uso medico. '),
-      "Usa un cardiofrequenzimetro o un saturimetro per misure affidabili. Su iOS la torcia non è accessibile da PWA: serve buona luce ambientale e dito fermo."
+      "Usa un cardiofrequenzimetro o un saturimetro per misure affidabili. Su iPhone (iOS 17+) l'app può accendere la torcia per un segnale più pulito; dove non è disponibile servono buona luce ambientale e dito fermo."
     ),
   );
 
   const startBtn = el('button', { class: 'btn', type: 'button' }, 'Attiva fotocamera');
   const stopBtn  = el('button', { class: 'btn secondary', type: 'button', disabled: true }, 'Stop');
+  // Toggle torcia: visibile solo se la fotocamera espone 'torch' (vedi onTorch).
+  const torchBtn = el('button', { class: 'btn ghost hidden', type: 'button' }, '🔦 Torcia');
+  const torchHint = el('p', { class: 'muted hidden', style: 'font-size:12px;margin-top:8px' },
+    'Torcia non disponibile su questo dispositivo (iPhone con iOS ≤16 o fotocamera senza flash): misura affidabile solo con buona luce ambientale e dito fermo.');
   const controls = el('div', { class: 'card' },
     el('div', { class: 'btn-row' }, startBtn, stopBtn),
+    el('div', { style: 'margin-top:10px' }, torchBtn),
+    torchHint,
     el('div', { class: 'kv', style: 'margin-top:12px' },
       el('dt', {}, 'Stato'),    el('dd', { id: 'hStatus' }, '—'),
       el('dt', {}, 'Qualità'),  el('dd', { id: 'hQual' },   '—'),
@@ -106,10 +112,30 @@ export function mount(container) {
     setBadge('#hQual', qLbl, qCls);
   }
 
+  // Stato torcia → mostra il toggle solo dove 'torch' è esposto, altrimenti
+  // mostra l'avviso onesto sull'affidabilità senza torcia.
+  function onTorch({ available, on }) {
+    if (available) {
+      torchHint.classList.add('hidden');
+      torchBtn.classList.remove('hidden');
+      torchBtn.classList.toggle('ok', on);
+      torchBtn.textContent = on ? '🔦 Torcia accesa — tocca per spegnere' : '🔦 Accendi torcia';
+    } else {
+      torchBtn.classList.add('hidden');
+      torchHint.classList.remove('hidden');
+    }
+  }
+
+  function resetTorchUI() {
+    torchBtn.classList.add('hidden');
+    torchBtn.classList.remove('ok');
+    torchHint.classList.add('hidden');
+  }
+
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
     rate.reset();
-    capture = new PpgCapture(onSample);
+    capture = new PpgCapture(onSample, onTorch);
     try {
       await capture.start();
     } catch (err) {
@@ -126,6 +152,7 @@ export function mount(container) {
     if (capture) { capture.stop(); capture = null; }
     startBtn.disabled = false;
     stopBtn.disabled = true;
+    resetTorchUI();
     setStatus('fermo', '');
     // Salva l'ultimo bpm per gli anelli salute della Home.
     const bpm = rate.perMinute();
@@ -134,6 +161,7 @@ export function mount(container) {
 
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
+  torchBtn.addEventListener('click', () => { if (capture) capture.setTorch(!capture.torchOn); });
 
   return { unmount() { stop(); } };
 }
