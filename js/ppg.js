@@ -81,6 +81,7 @@ export class PpgCapture {
     this.filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
     this.quality = 0;
     this.fingerLost = 0;   // frame consecutivi senza dito (per la resettatura ritardata)
+    this.fingerWas = false; // stato dito precedente (isteresi anti-sfarfallio)
   }
 
   // Buffer del segnale filtrato (per il grafico live nel consumatore).
@@ -111,7 +112,7 @@ export class PpgCapture {
     this.offCtx = this.off.getContext('2d', { willReadFrequently: true });
 
     this.bp.reset(); this.peaks.reset(); this.filtBuf.clear();
-    this.lastTs = 0; this.quality = 0; this.fingerLost = 0;
+    this.lastTs = 0; this.quality = 0; this.fingerLost = 0; this.fingerWas = false;
     this.active = true;
     this.rafId = requestAnimationFrame(() => this._loop());
 
@@ -269,10 +270,15 @@ export class PpgCapture {
       const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
       const satPct = satCount / n;       // 0..1: frazione della ROI col rosso saturo
 
-      // Dito ben appoggiato: il rosso domina su verde/blu. Soglie un filo più
-      // permissive (1.15 invece di 1.2) per ridurre i drop-out spuri quando la
-      // torcia illumina molto la pelle.
-      const fingerOk = meanR > 55 && meanR > meanG * 1.15 && meanR > meanB * 1.15;
+      // Dito ben appoggiato: il rosso domina su verde/blu. ISTERESI: una volta
+      // rilevato il dito, lo si "mantiene" con soglie più morbide. Senza questo,
+      // la stessa pulsazione PPG (che fa oscillare meanR) può far scendere il
+      // segnale sotto la soglia di acquisizione per qualche frame → fingerOk
+      // sfarfalla → il rilevatore si azzera di continuo → bpm fermo su "—".
+      const acquire  = meanR > 55 && meanR > meanG * 1.15 && meanR > meanB * 1.15;
+      const maintain = meanR > 45 && meanR > meanG * 1.05 && meanR > meanB * 1.05;
+      const fingerOk = this.fingerWas ? maintain : acquire;
+      this.fingerWas = fingerOk;
 
       const now = performance.now();
       const dt = this.lastTs ? (now - this.lastTs) / 1000 : 1 / SAMPLE_HZ;
@@ -292,16 +298,16 @@ export class PpgCapture {
 
       let isPeak = false, intervalMs = 0;
       if (fingerOk) {
-        // Se c'era stato un buco (anche 1 frame), riparti pulito: altrimenti il
-        // primo picco dopo il buco darebbe un intervallo = tutta la pausa → RR
-        // spurio enorme che falsa il bpm. Su un contatto stabile fingerLost
-        // resta 0 e non si resetta mai.
-        if (this.fingerLost > 0) this.peaks.reset();
+        // NON resettare il rilevatore a ogni micro-buco: un drop-out transitorio
+        // azzererebbe inviluppo/ritmo e — con dito un po' ballerino — impedirebbe
+        // del tutto il conteggio (bpm "—"). Reset solo dopo perdita SOSTENUTA
+        // (~0.7 s). L'eventuale RR spurio al rientro è scartato dal filtro
+        // outlier nel consumatore (heart.js / stress.js).
         this.fingerLost = 0;
         const r = this.peaks.step(filt, now);
         isPeak = r.isPeak; intervalMs = r.intervalMs;
       } else {
-        this.fingerLost++;
+        if (++this.fingerLost > 20) this.peaks.reset();
       }
 
       if (this.onSample) {
