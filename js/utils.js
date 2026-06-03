@@ -127,12 +127,19 @@ export class BandPass {
 //     e quando dall'ultimo picco è passato almeno `minIntervalMs`.
 //   - minIntervalMs serve a evitare doppi conteggi (refrattarietà):
 //       60 bpm → 1000 ms, 240 bpm → 250 ms → per PPG usiamo ~300 ms (≈200 bpm).
-//   - ISTERESI: dopo un picco il rilevatore si "disarma" e si ri-arma solo
-//     quando il segnale ridiscende sotto la media (baseline). Garantisce UN
-//     picco per ciclo cardiaco: l'incisura dicrota (secondo picco fisiologico
-//     ~250–400 ms dopo la sistole) e i bozzi di rumore che restano sopra la
-//     baseline NON vengono più contati come battiti separati. È la difesa
-//     principale contro l'RMSSD gonfiato da doppio conteggio.
+//   - ISTERESI (ri-armatura RELATIVA all'ultimo picco): dopo un picco il
+//     rilevatore si "disarma" e si ri-arma solo quando il segnale è ridisceso
+//     a metà strada tra l'ultimo picco e la baseline:
+//         reArm = mean + 0.5·(lastPeakValue − mean)
+//     Garantisce UN picco per ciclo cardiaco (l'incisura dicrota e i bozzi di
+//     rumore che restano in alto NON vengono ri-contati), MA — a differenza di
+//     una soglia assoluta come `value < mean` — la condizione si auto-scala con
+//     l'ampiezza del battito e NON dipende dal valore assoluto della media.
+//     Questo la rende immune alla deriva lenta (respiro/movimento): quando
+//     un'onda lenta solleva il segnale, una soglia a `mean` non viene più
+//     attraversata verso il basso tra due sistoli → l'isteresi non si ri-arma
+//     → un battito sì e uno no → bpm dimezzato. La soglia relativa, invece, si
+//     ri-arma a ogni discesa del battito qualunque sia l'offset lento.
 //   - L'output è { isPeak, intervalMs } da consumare al chiamante.
 // ---------------------------------------------------------------------------
 export class PeakDetector {
@@ -144,6 +151,8 @@ export class PeakDetector {
     this.prevPrev = -Infinity;
     this.window = new RingBuffer(64);
     this.armed = true; // pronto a rilevare un nuovo picco (isteresi)
+    this.lastPeakValue = null; // valore dell'ultimo picco accettato (per la ri-armatura relativa)
+    this.reArmFrac = 0.5;      // frazione della discesa picco→baseline che ri-arma
   }
   step(value, ts) {
     this.window.push(value);
@@ -154,9 +163,14 @@ export class PeakDetector {
     let isPeak = false;
     let intervalMs = 0;
 
-    // Ri-arma quando il segnale torna sotto la baseline: serve un attraversamento
-    // verso il basso prima di accettare il prossimo picco → un picco per ciclo.
-    if (value < mean) this.armed = true;
+    // Ri-armatura RELATIVA all'ultimo picco: serve che il segnale ridiscenda a
+    // metà strada tra l'ultimo picco e la baseline. Auto-scala con l'ampiezza e
+    // resta immune alla deriva lenta (vedi commento sopra). Finché non c'è un
+    // picco di riferimento, ricade sulla baseline (`value < mean`).
+    const reArmLevel = this.lastPeakValue != null
+      ? mean + this.reArmFrac * (this.lastPeakValue - mean)
+      : mean;
+    if (value < reArmLevel) this.armed = true;
 
     // Massimo locale: il campione precedente è maggiore di quello prima e di
     // quello dopo (i.e. value, che ora è "il dopo"). Quindi controlliamo
@@ -172,7 +186,8 @@ export class PeakDetector {
         isPeak = true;
         intervalMs = this.lastPeakTs === 0 ? 0 : dt;
         this.lastPeakTs = ts;
-        this.armed = false; // disarma fino al prossimo ritorno sotto baseline
+        this.lastPeakValue = this.prevValue; // riferimento per la ri-armatura relativa
+        this.armed = false; // disarma fino alla discesa a reArmLevel
       }
     }
     this.prevPrev = this.prevValue;
@@ -185,6 +200,7 @@ export class PeakDetector {
     this.prevPrev = -Infinity;
     this.window.clear();
     this.armed = true;
+    this.lastPeakValue = null;
   }
 }
 
