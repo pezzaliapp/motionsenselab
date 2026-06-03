@@ -21,31 +21,15 @@
 //   - mantenere il dito FERMO è essenziale: rumore di movimento >> segnale PPG.
 // ============================================================================
 
-import { el, RingBuffer, BandPass, PeakDetector, RateEstimator, fmt, drawTrace } from '../utils.js';
-import { requestCamera } from '../permissions.js';
-
-const ROI_SIZE = 80;              // ROI 80x80 al centro del frame
-const PROC_W = 160, PROC_H = 120; // dimensione canvas off-screen
-const WINDOW_S = 8;
-const SAMPLE_HZ = 30;             // tipico frame rate video
+import { el, RateEstimator, drawTrace } from '../utils.js';
+import { PpgCapture } from '../ppg.js';
 
 export function mount(container) {
-  let stream = null;
-  let video = null;
-  let off = null, offCtx = null;
-  let active = false;
-  let rafId = null;
-  let lastTs = 0;
+  // La cattura PPG (camera, filtro, picchi, qualità) è incapsulata in PpgCapture
+  // e condivisa con il modulo Stress. Qui consumiamo i campioni per stimare i bpm.
+  let capture = null;
 
-  // Filtri & detector
-  // Banda PPG: 0.7 Hz (42 bpm) – 4 Hz (240 bpm).
-  const bp = new BandPass(0.7, 4.0);
-  // Refrattarietà 280 ms ≈ massimo 214 bpm (oltre è artefatto).
-  const peaks = new PeakDetector({ minIntervalMs: 280, k: 0.5 });
   const rate = new RateEstimator(8);
-
-  const filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
-  let qualityScore = 0;            // 0..1, ratio segnale/rumore
 
   // ---- UI ----
   const intro = el('div', { class: 'card' },
@@ -101,119 +85,44 @@ export function mount(container) {
   }
   function setStatus(s, cls = '') { setBadge('#hStatus', s, cls); }
 
-  // ---- Pipeline frame ----
-  // Calcola la media del canale rosso sulla ROI centrale del video.
-  function processFrame(ts) {
-    if (!active) return;
-    if (video.readyState >= 2) {
-      // Disegniamo il frame su canvas off-screen.
-      offCtx.drawImage(video, 0, 0, PROC_W, PROC_H);
-      // ROI centrale
-      const sx = (PROC_W - ROI_SIZE) >> 1;
-      const sy = (PROC_H - ROI_SIZE) >> 1;
-      const img = offCtx.getImageData(sx, sy, ROI_SIZE, ROI_SIZE).data;
+  // ---- Consumo dei campioni PPG ----
+  // Per ogni frame aggiorniamo l'indicatore "dito/luce" e, sui picchi validi,
+  // alimentiamo il RateEstimator. Il rendering del grafico e dei bpm avviene qui.
+  function onSample(s) {
+    setBadge('#hLight', s.fingerOk ? 'dito rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
 
-      let sumR = 0, sumG = 0, sumB = 0;
-      const n = ROI_SIZE * ROI_SIZE;
-      for (let i = 0; i < img.length; i += 4) {
-        sumR += img[i];
-        sumG += img[i + 1];
-        sumB += img[i + 2];
-      }
-      const meanR = sumR / n;
-      const meanG = sumG / n;
-      const meanB = sumB / n;
+    if (s.fingerOk && s.isPeak && s.intervalMs > 0) rate.push(s.intervalMs);
 
-      // Diagnostica qualitativa: se il dito è ben appoggiato, R domina su G/B
-      // (luce filtrata dal sangue → il rosso passa, verde/blu vengono assorbiti).
-      // Se R, G, B sono simili → la camera vede l'ambiente, non un dito.
-      const fingerOk = meanR > 60 && meanR > meanG * 1.2 && meanR > meanB * 1.2;
-      setBadge('#hLight', fingerOk ? 'dito rilevato' : 'posiziona il dito', fingerOk ? 'ok' : 'warn');
+    drawTrace(canvas, capture.filtered(), { color: '#ff5b6e' });
+    const bpm = rate.perMinute();
+    setText('#hBpm', bpm > 0 ? Math.round(bpm).toString() : '—');
 
-      // dt reale: video.requestVideoFrameCallback non è ancora universale su
-      // iOS → usiamo performance.now su RAF, che è "abbastanza buono".
-      const now = performance.now();
-      const dt = lastTs ? (now - lastTs) / 1000 : 1 / SAMPLE_HZ;
-      lastTs = now;
-
-      // Filtro passa-banda sul valore medio del rosso.
-      const filt = bp.step(meanR, dt);
-      filtBuf.push(filt);
-
-      // Stima qualità: SNR grossolano = std(filtrato) / std(grezzo).
-      // Quando il filtrato ha ampiezza significativa rispetto al rumore →
-      // la pulsazione è chiara. Normalizziamo in 0..1.
-      const arr = filtBuf.toArray();
-      if (arr.length > 30) {
-        let mean = 0; for (let i = 0; i < arr.length; i++) mean += arr[i]; mean /= arr.length;
-        let varr = 0; for (let i = 0; i < arr.length; i++) varr += (arr[i] - mean) * (arr[i] - mean);
-        varr /= arr.length;
-        // amplitude usable se varianza > 0.2 (unità grezze del canale R filtrato)
-        qualityScore = Math.min(1, Math.sqrt(varr) / 2);
-      }
-
-      // Peak detection solo se il dito è plausibilmente rilevato.
-      if (fingerOk) {
-        const r = peaks.step(filt, now);
-        if (r.isPeak && r.intervalMs > 0) {
-          rate.push(r.intervalMs);
-        }
-      } else {
-        peaks.reset();
-      }
-
-      // Render
-      drawTrace(canvas, arr, { color: '#ff5b6e' });
-      const bpm = rate.perMinute();
-      setText('#hBpm', bpm > 0 ? Math.round(bpm).toString() : '—');
-
-      // Qualità label
-      let qLbl, qCls;
-      if (!fingerOk)          { qLbl = 'in attesa'; qCls = ''; }
-      else if (qualityScore < 0.2) { qLbl = 'bassa';     qCls = 'bad'; }
-      else if (qualityScore < 0.5) { qLbl = 'media';     qCls = 'warn'; }
-      else                          { qLbl = 'buona';    qCls = 'ok'; }
-      setBadge('#hQual', qLbl, qCls);
-    }
-    rafId = requestAnimationFrame(processFrame);
+    let qLbl, qCls;
+    if (!s.fingerOk)            { qLbl = 'in attesa'; qCls = ''; }
+    else if (s.quality < 0.2)  { qLbl = 'bassa';     qCls = 'bad'; }
+    else if (s.quality < 0.5)  { qLbl = 'media';     qCls = 'warn'; }
+    else                        { qLbl = 'buona';    qCls = 'ok'; }
+    setBadge('#hQual', qLbl, qCls);
   }
 
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
+    rate.reset();
+    capture = new PpgCapture(onSample);
     try {
-      stream = await requestCamera();
+      await capture.start();
     } catch (err) {
+      capture = null;
       setStatus('permesso negato o fotocamera non disponibile', 'bad');
       return;
     }
-    // <video> nascosto: serve solo come "sorgente" per drawImage.
-    video = document.createElement('video');
-    video.playsInline = true;
-    video.muted = true;
-    video.autoplay = true;
-    video.srcObject = stream;
-    try { await video.play(); } catch {}
-
-    off = document.createElement('canvas');
-    off.width = PROC_W; off.height = PROC_H;
-    offCtx = off.getContext('2d', { willReadFrequently: true });
-
-    bp.reset(); peaks.reset(); rate.reset(); filtBuf.clear();
-    lastTs = 0; qualityScore = 0;
-    active = true;
     startBtn.disabled = true;
     stopBtn.disabled = false;
     setStatus('attivo', 'ok');
-    rafId = requestAnimationFrame(processFrame);
   }
 
   function stop() {
-    active = false;
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = null;
-    if (stream) { for (const t of stream.getTracks()) t.stop(); }
-    if (video) { try { video.pause(); video.srcObject = null; } catch {} }
-    stream = null; video = null; off = null; offCtx = null;
+    if (capture) { capture.stop(); capture = null; }
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('fermo', '');
