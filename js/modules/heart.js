@@ -67,28 +67,6 @@ export function mount(container) {
     ),
   );
 
-  // ---- Sonda diagnostica (read-only) ----
-  // Mostra cosa la fotocamera sta realmente usando: quale lente (deviceId/label),
-  // i settings della traccia e le capabilities (in particolare se 'torch' è esposto).
-  // Su iPhone non c'è una console comoda: stampiamo qui + bottone "Copia".
-  // -webkit-user-select/-webkit-touch-callout espliciti: su iOS in PWA la
-  // clipboard API spesso fallisce; così il JSON resta selezionabile a mano
-  // (long-press → Seleziona) o fotografabile, e la copia col bottone è solo un extra.
-  // Read-out LIVE (aggiornato ~1×/s): meanR/G/B e % saturazione del rosso.
-  // Serve a distinguere "AGC che schiaccia la AC" da "rosso clippato a 255":
-  // se la saturazione è alta il segnale è tagliato; se è bassa ma l'onda resta
-  // sbavata il sospetto resta l'auto-esposizione/white-balance.
-  const diagLive = el('pre', { id: 'hDiagLive', style: 'white-space:pre-wrap;font-size:11px;margin:0 0 8px;background:rgba(255,255,255,.04);padding:10px;border-radius:8px;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default' }, '— canale rosso live: attiva la fotocamera —');
-  const diagPre = el('pre', { id: 'hDiag', style: 'white-space:pre-wrap;word-break:break-word;font-size:11px;margin:0;max-height:280px;overflow:auto;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default;background:rgba(255,255,255,.04);padding:10px;border-radius:8px' }, '— attiva la fotocamera per leggere i dati —');
-  const diagCopy = el('button', { class: 'btn ghost', type: 'button', style: 'margin-top:8px' }, 'Copia diagnostica');
-  const diagCard = el('div', { class: 'card' },
-    el('h3', {}, '🔍 Diagnostica camera (read-only)'),
-    el('p', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, 'Quale lente viene aperta, i suoi settings, quali controlli sono manuali e se il rosso è saturo. Non altera la misura.'),
-    diagLive,
-    diagPre,
-    diagCopy,
-  );
-
   const canvas = el('canvas', { height: 140, 'aria-label': 'Onda PPG' });
   const graphCard = el('div', { class: 'card' },
     el('h3', {}, 'Forma d\'onda PPG (filtrata)'),
@@ -99,7 +77,6 @@ export function mount(container) {
   container.appendChild(intro);
   container.appendChild(controls);
   container.appendChild(bpmCard);
-  container.appendChild(diagCard);
   container.appendChild(graphCard);
 
   // ---- helpers UI ----
@@ -118,28 +95,18 @@ export function mount(container) {
   // ---- Consumo dei campioni PPG ----
   // Per ogni frame aggiorniamo l'indicatore "dito/luce" e, sui picchi validi,
   // alimentiamo il RateEstimator. Il rendering del grafico e dei bpm avviene qui.
-  let lastLiveTs = 0;
   function onSample(s) {
     setBadge('#hLight', s.fingerOk ? 'dito rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
-
-    // Diagnostica live (~1×/s): canale rosso medio + saturazione. Read-only.
-    if (s.ts - lastLiveTs > 900) {
-      lastLiveTs = s.ts;
-      const sat = (s.satPct * 100);
-      diagLive.textContent =
-        `meanR=${s.meanR.toFixed(1)}  meanG=${s.meanG.toFixed(1)}  meanB=${s.meanB.toFixed(1)}\n` +
-        `saturazione rosso (R≥250): ${sat.toFixed(1)}%${sat > 50 ? '  ← CLIPPING: segnale tagliato' : ''}\n` +
-        `dito: ${s.fingerOk ? 'sì' : 'no'}   ampiezza AC (qualità): ${s.quality.toFixed(3)}`;
-    }
 
     if (s.fingerOk && s.isPeak && s.intervalMs > 0) rate.push(s.intervalMs);
 
     drawTrace(canvas, capture.filtered(), { color: '#ff5b6e' });
-    // Mostra un numero solo se affidabile: dito presente, segnale con ampiezza
-    // sufficiente e bpm fisiologico. Altrimenti "—" (onestà: niente numeri su
-    // rumore o segnale assente).
+    // Mostra un numero quando il dito è presente e il bpm è fisiologico. Niente
+    // gate sull'ampiezza assoluta: il rilevatore lavora sul segnale NORMALIZZATO
+    // (vedi PeakDetector.envelope) e l'ampiezza grezza del PPG dal vivo varia
+    // troppo da device a device per fissarci una soglia. Senza dito → "—".
     const bpm = rate.perMinute();
-    const reliable = s.fingerOk && s.quality >= 0.15 && bpm >= 40 && bpm <= 200;
+    const reliable = s.fingerOk && bpm >= 40 && bpm <= 200;
     setText('#hBpm', reliable ? Math.round(bpm).toString() : '—');
 
     let qLbl, qCls;
@@ -164,61 +131,6 @@ export function mount(container) {
     }
   }
 
-  // Riceve la sonda read-only da PpgCapture e la rende leggibile/copiabile.
-  let lastDiag = null;
-  function onDiag(info) {
-    lastDiag = info;
-    const caps = info.capabilities || {};
-    const ctrl = info.controls || {};
-
-    // Quali controlli AGC/AWB/AF sono davvero pilotabili su questo device:
-    // un 'modo' è utile se ammette 'manual'; un range se espone min/max/step.
-    const fmtMode = (name, arr) => {
-      if (!arr) return `  ${name}: (assente)`;
-      const list = Array.isArray(arr) ? arr : [arr];
-      const ok = list.includes('manual');
-      return `  ${name}: [${list.join(', ')}]${ok ? '  ← manual disponibile' : '  (no manual)'}`;
-    };
-    const fmtRange = (name, r) => {
-      if (!r) return `  ${name}: (assente)`;
-      return `  ${name}: min=${r.min} max=${r.max} step=${r.step}  ← regolabile`;
-    };
-
-    const applied = info.ppgConstraintsApplied;
-    const lines = [
-      `lente attiva: ${info.activeLabel || '(label non disponibile)'}`,
-      `ultra-grandangolo: ${info.lensSwitched ? 'SÌ — ri-aperta ✓' : 'no (resta lente default)'}`,
-      `constraint PPG applicati: ${applied && Object.keys(applied).length ? JSON.stringify(applied) : (applied ? 'nessuno (tutti rifiutati)' : '(non ancora applicati)')}`,
-      '',
-      `torch esposto: ${'torch' in caps ? caps.torch : '(assente)'}`,
-      `zoom esposto:  ${'zoom' in caps ? JSON.stringify(caps.zoom) : '(assente)'}`,
-      '',
-      'controlli manuali (le leve per i prossimi commit):',
-      fmtMode('exposureMode', ctrl.exposureMode),
-      fmtMode('focusMode', ctrl.focusMode),
-      fmtMode('whiteBalanceMode', ctrl.whiteBalanceMode),
-      fmtRange('exposureCompensation', ctrl.exposureCompensation),
-      fmtRange('focusDistance', ctrl.focusDistance),
-      fmtRange('zoom', ctrl.zoom),
-      '',
-      'settings (lente attiva):',
-      JSON.stringify(info.settings || {}, null, 2),
-      '',
-      'capabilities:',
-      JSON.stringify(caps, null, 2),
-      '',
-      `camere posteriori viste (${(info.videoInputs || []).length}):`,
-      JSON.stringify(info.videoInputs || [], null, 2),
-    ];
-    diagPre.textContent = lines.join('\n');
-  }
-  diagCopy.addEventListener('click', async () => {
-    const txt = lastDiag ? JSON.stringify(lastDiag, null, 2) : diagPre.textContent;
-    try { await navigator.clipboard.writeText(txt); diagCopy.textContent = 'Copiato ✓'; }
-    catch { diagCopy.textContent = 'Copia non riuscita — seleziona il testo'; }
-    setTimeout(() => { diagCopy.textContent = 'Copia diagnostica'; }, 1800);
-  });
-
   function resetTorchUI() {
     torchBtn.classList.add('hidden');
     torchBtn.classList.remove('ok');
@@ -228,7 +140,7 @@ export function mount(container) {
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
     rate.reset();
-    capture = new PpgCapture(onSample, onTorch, onDiag);
+    capture = new PpgCapture(onSample, onTorch);
     try {
       await capture.start();
     } catch (err) {
