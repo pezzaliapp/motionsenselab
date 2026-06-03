@@ -17,9 +17,12 @@ PWA dimostrativa, educativa e **realmente funzionante**: usa i sensori reali del
 | **Passi**         | Accel           | Bandpass 0.6–3 Hz + peak detector; classifica fermo / cammino / corsa. |
 | **Audio**         | Microfono       | Livello dB relativo, spettrogramma scrolling, presence detection.      |
 | **Battito**       | Fotocamera      | PPG sul canale rosso del polpastrello, bandpass 0.7–4 Hz, bpm.         |
+| **Stress (HRV)**  | Fotocamera      | Dagli intervalli RR del PPG: RMSSD/SDNN → indice di stress 0–100 (gauge). |
 | **Respiro**       | Accel (su petto)| Bandpass 0.1–0.5 Hz su accel.z, atti/min + qualità SNR.                |
 
-Più: dashboard con stato permessi, pagine "Come funziona" e "Limiti & privacy".
+Più: **Home con "anelli salute"** (gauge degli ultimi valori reali misurati, on-device, non live), dashboard con stato permessi, pagine "Come funziona" e "Limiti & privacy".
+
+> **Lo Stress è un indice _indicativo_, non clinico.** È derivato dalla variabilità della frequenza cardiaca (HRV) con una scala euristica (RMSSD 10–80 ms), lo stesso principio degli smartwatch consumer — ma non è una misura medica dello stress. Coerentemente con la filosofia del progetto, **non** mostriamo pressione sanguigna, glicemia o "scansioni d'organo": non sono misurabili in modo affidabile dai sensori di uno smartphone.
 
 ---
 
@@ -47,6 +50,7 @@ Più: dashboard con stato permessi, pagine "Come funziona" e "Limiti & privacy".
 - **Rate estimator**: mediana mobile sugli intervalli inter-picco → `60_000 / mediana` = eventi/minuto. Robusto a outlier (movimenti spuri).
 - **Fall detection**: FSM idle → impact (|a|>2.5 g) → stillness (σ|a|<0.3 g per 1 s) → evento confermato. Cooldown 4 s per non duplicare.
 - **Presence sonora**: calibrazione baseline di 3 s, poi `dB > baseline + 6 dB` mantenuto per 2 s → presenza.
+- **Indice di stress (HRV)**: dagli intervalli RR del PPG, filtrati (300–1500 ms, salti < 25 %), su finestra mobile di 60 s → `RMSSD = √mean(ΔRR²)`. Mappa euristica `stress = clamp(100 − scale(RMSSD), 0, 100)` con `scale` lineare su RMSSD 10–80 ms. Mostrato solo con qualità sufficiente e ≥ 20 battiti validi; altrimenti "—".
 
 Vedi `js/utils.js` per le implementazioni e i commenti.
 
@@ -106,6 +110,9 @@ I permessi sensori NON funzionano da `file://` o da `http://` non-localhost.
     ├── app.js              # bootstrap, hash router, SW registration
     ├── utils.js            # ring buffer, filtri IIR, peak detector, DOM helpers
     ├── permissions.js      # wrapper getUserMedia + DeviceMotion.requestPermission
+    ├── ppg.js              # motore PPG condiviso (camera→filtro→picchi→RR), usato da heart + stress
+    ├── gauge.js            # gauge/anello circolare riutilizzabile (canvas)
+    ├── store.js            # ultime misure on-device (localStorage) per gli anelli salute
     └── modules/
         ├── dashboard.js
         ├── movement.js
@@ -113,6 +120,7 @@ I permessi sensori NON funzionano da `file://` o da `http://` non-localhost.
         ├── steps.js
         ├── sound.js
         ├── heart.js
+        ├── stress.js
         ├── breath.js
         └── info.js
 ```
@@ -132,11 +140,11 @@ Ogni modulo è un ES module che esporta `mount(container) → { unmount() }`. Pe
 
 ## Privacy
 
-Niente upload, niente login, niente cookie, niente analytics. L'audio e il video acquisiti vengono elaborati in tempo reale e poi **scartati**: nessun frame, nessun campione audio, nessuna misura lascia il dispositivo.
+Niente upload, niente login, niente cookie, niente analytics. L'audio e il video acquisiti vengono elaborati in tempo reale e poi **scartati**: nessun frame, nessun campione audio lascia il dispositivo. Gli "anelli salute" salvano in `localStorage` solo l'**ultimo valore numerico** di ciascuna metrica (es. `72 bpm`), sempre on-device: nessun dato lascia il telefono.
 
 ## Non è un dispositivo medico
 
-Le misure di battito, respiro e caduta sono **indicative**, ottenute con sensori non calibrati in un ambiente non controllato. Per uso clinico servono dispositivi certificati.
+Le misure di battito, respiro, caduta e l'indice di stress sono **indicative**, ottenute con sensori non calibrati in un ambiente non controllato. In particolare lo **stress** è un indice euristico derivato dall'HRV, non una misura clinica. Per uso clinico servono dispositivi certificati. Non vengono mostrati pressione sanguigna, glicemia o diagnosi: non sono misurabili in modo affidabile da uno smartphone.
 
 ---
 
