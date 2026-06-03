@@ -21,6 +21,7 @@
 
 import { el, RingBuffer, BandPass, PeakDetector, RateEstimator, fmt, drawTrace } from '../utils.js';
 import { requestMotionPermission } from '../permissions.js';
+import { setMetric } from '../store.js';
 
 const WINDOW_S = 30;
 const SAMPLE_HZ = 50;
@@ -159,6 +160,9 @@ export function mount(container) {
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('fermo', '');
+    // Salva l'ultima frequenza respiratoria per gli anelli salute.
+    const v = rate.perMinute();
+    if (v > 0) setMetric('breath', Math.round(v), '/min');
   }
 
   startBtn.addEventListener('click', start);

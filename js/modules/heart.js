@@ -23,6 +23,7 @@
 
 import { el, RateEstimator, drawTrace } from '../utils.js';
 import { PpgCapture } from '../ppg.js';
+import { setMetric } from '../store.js';
 
 export function mount(container) {
   // La cattura PPG (camera, filtro, picchi, qualità) è incapsulata in PpgCapture
@@ -126,6 +127,9 @@ export function mount(container) {
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('fermo', '');
+    // Salva l'ultimo bpm per gli anelli salute della Home.
+    const bpm = rate.perMinute();
+    if (bpm > 0) setMetric('hr', Math.round(bpm), 'bpm');
   }
 
   startBtn.addEventListener('click', start);

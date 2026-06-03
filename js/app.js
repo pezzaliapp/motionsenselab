@@ -16,6 +16,7 @@ const ROUTES = {
   steps:    () => import('./modules/steps.js'),
   sound:    () => import('./modules/sound.js'),
   heart:    () => import('./modules/heart.js'),
+  stress:   () => import('./modules/stress.js'),
   breath:   () => import('./modules/breath.js'),
   info:     () => import('./modules/info.js'),
 };

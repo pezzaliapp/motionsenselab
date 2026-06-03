@@ -16,6 +16,7 @@
 
 import { el, RingBuffer, BandPass, PeakDetector, fmt, drawTrace } from '../utils.js';
 import { requestMotionPermission } from '../permissions.js';
+import { setMetric } from '../store.js';
 
 const SAMPLE_HZ = 50;     // stima media; il filtro usa dt reale
 const WINDOW_S = 6;
@@ -172,6 +173,8 @@ export function mount(container) {
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('fermo', '');
+    // Salva i passi della sessione per gli anelli salute.
+    if (stepCount > 0) setMetric('steps', stepCount, 'passi');
   }
 
   startBtn.addEventListener('click', start);
