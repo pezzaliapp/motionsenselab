@@ -39,7 +39,7 @@ Più: **Home con "anelli salute"** (gauge degli ultimi valori reali misurati, on
 | `navigator.vibrate`                | feedback aptico al rilevamento caduta (Android)         |
 | `Service Worker` + `Cache API`     | funzionamento offline                                   |
 
-**Tutte le API sono supportate da Safari iOS in PWA installata.** Non usiamo Web Bluetooth, Generic Sensor API, Wake Lock, torcia o altre API non disponibili su iOS.
+**Tutte le API sono supportate da Safari iOS in PWA installata.** Non usiamo Web Bluetooth, Generic Sensor API o Wake Lock. La **torcia** della fotocamera è controllata via `MediaStreamTrack.applyConstraints({ advanced: [{ torch: true }] })`: supportata da **iOS 17+** (e Android Chrome) quando `getCapabilities()` espone `torch`; dove non lo espone, l'app ricade in automatico sulla luce ambientale.
 
 ---
 
@@ -72,7 +72,7 @@ L'app comparirà con la sua icona, fullscreen senza barra Safari, e funzionerà 
 ## Limiti noti su iOS
 
 - **DeviceMotion**: richiede `requestPermission()` invocato da un gesto utente. Il primo tap su "Attiva" mostra il prompt di sistema.
-- **Torcia della fotocamera**: non accessibile da PWA su iOS. Il PPG funziona con luce ambientale; se possibile posizionati vicino a una sorgente luminosa.
+- **Torcia della fotocamera**: controllabile da **iOS 17+** (e Android Chrome) tramite i *track constraints* (`applyConstraints({ advanced: [{ torch: true }] })`), purché `getCapabilities()` esponga `torch` sulla camera posteriore. I moduli Battito e Stress la accendono automaticamente all'avvio e mostrano un toggle. Su **iOS ≤16** o fotocamere senza flash non è disponibile: l'app lo segnala e il PPG funziona con buona luce ambientale. L'API `ImageCapture` resta assente su Safari, ma non serve a questo scopo.
 - **Wake Lock**: API limitata; le sessioni lunghe potrebbero subire screen-dim. Tieni il telefono "in uso" durante misurazioni lunghe (PPG, respiro).
 - **AudioContext**: parte in `suspended`; richiede un gesto utente per `resume()`. Gestito automaticamente dal modulo audio.
 - **HTTPS obbligatorio**: i permessi sensori funzionano solo su origin sicuri (localhost o HTTPS, inclusi i siti GitHub Pages).
