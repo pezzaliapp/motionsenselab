@@ -118,7 +118,19 @@ export class PpgCapture {
         .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
     } catch {}
     if (!this.active) return;            // l'utente può aver già fermato
-    if (this.onDiag) this.onDiag({ settings, capabilities, videoInputs });
+    // Sintesi read-only dei controlli che CONTANO per l'AGC/AWB/AF: diciamo
+    // esplicitamente quali sono esposti e se ammettono 'manual'/un range, così
+    // i prossimi commit (lock esposizione/WB/focus) sono mirati, non a tentativi.
+    const c = capabilities || {};
+    const controls = {
+      exposureMode:         c.exposureMode || null,          // es. ['continuous','manual']
+      focusMode:            c.focusMode || null,             // es. ['continuous','manual']
+      whiteBalanceMode:     c.whiteBalanceMode || null,      // es. ['continuous','manual']
+      exposureCompensation: c.exposureCompensation || null,  // {min,max,step}
+      focusDistance:        c.focusDistance || null,         // {min,max,step}
+      zoom:                 c.zoom || null,                  // {min,max,step}
+    };
+    if (this.onDiag) this.onDiag({ settings, capabilities, videoInputs, controls });
   }
 
   // Legge getCapabilities() sulla traccia live. Su alcuni device le capabilities
@@ -168,12 +180,15 @@ export class PpgCapture {
       const sy = (PROC_H - ROI_SIZE) >> 1;
       const img = this.offCtx.getImageData(sx, sy, ROI_SIZE, ROI_SIZE).data;
 
-      let sumR = 0, sumG = 0, sumB = 0;
+      let sumR = 0, sumG = 0, sumB = 0, satCount = 0;
       const n = ROI_SIZE * ROI_SIZE;
       for (let i = 0; i < img.length; i += 4) {
-        sumR += img[i]; sumG += img[i + 1]; sumB += img[i + 2];
+        const R = img[i];
+        sumR += R; sumG += img[i + 1]; sumB += img[i + 2];
+        if (R >= 250) satCount++;        // diagnostica: pixel col rosso a fondo scala (clipping)
       }
       const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+      const satPct = satCount / n;       // 0..1: frazione della ROI col rosso saturo
 
       // Dito ben appoggiato: il rosso domina su verde/blu.
       const fingerOk = meanR > 60 && meanR > meanG * 1.2 && meanR > meanB * 1.2;
@@ -203,7 +218,7 @@ export class PpgCapture {
       }
 
       if (this.onSample) {
-        this.onSample({ meanR, meanG, meanB, fingerOk, filt, quality: this.quality, isPeak, intervalMs, ts: now });
+        this.onSample({ meanR, meanG, meanB, satPct, fingerOk, filt, quality: this.quality, isPeak, intervalMs, ts: now });
       }
     }
     this.rafId = requestAnimationFrame(() => this._loop());
