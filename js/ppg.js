@@ -56,6 +56,13 @@ export class PpgCapture {
     this.torchOn = false;
     this._torchTimer = null;
 
+    // Lente + constraints PPG (vedi start / _maybeSwitchToUltraWide /
+    // _applyPpgConstraints): su iPhone la lente giusta per il contatto è
+    // l'ULTRA-GRANDANGOLO posteriore (fuoco ravvicinato), e l'AWB va bloccato.
+    this.lensSwitched = false;          // true se abbiamo ri-aperto l'ultra-wide
+    this.ppgConstraintsApplied = null;  // { whiteBalanceMode?, focusDistance?, ... }
+    this._ppgConstraintsTimer = null;
+
     // Banda PPG 0.9–4 Hz; refrattarietà 300 ms ≈ max 200 bpm + isteresi
     // (vedi PeakDetector): un picco per ciclo, niente doppio conteggio dicrota.
     // High-pass alzato 0.7→0.9 Hz: attenua la deriva lenta (respiro/movimento,
@@ -73,8 +80,18 @@ export class PpgCapture {
   filtered() { return this.filtBuf.toArray(); }
 
   async start() {
+    this.lensSwitched = false;
+    this.ppgConstraintsApplied = null;
     this.stream = await requestCamera();   // può rilanciare: gestito dal chiamante
     this.track = this.stream.getVideoTracks()[0] || null;
+
+    // Lente giusta per il PPG a contatto: l'ULTRA-GRANDANGOLO posteriore ha
+    // fuoco ravvicinato, mentre la wide/tele standard col dito a contatto
+    // (focusDistance min ~0.02) è quasi sempre fuori fuoco. enumerateDevices
+    // espone le label solo DOPO il primo getUserMedia (permesso appena
+    // concesso qui sopra), quindi solo ora possiamo individuarla e ri-aprirla.
+    await this._maybeSwitchToUltraWide();
+
     const video = document.createElement('video');
     video.playsInline = true;
     video.muted = true;
@@ -97,8 +114,85 @@ export class PpgCapture {
     this._detectTorch();
     if (this.torchAvailable) this.setTorch(true);
 
+    // Blocca l'AWB (whiteBalanceMode 'manual') e, se possibile, forza il fuoco
+    // ravvicinato. L'auto-white-balance/auto-exposure altrimenti "inseguono" la
+    // pulsazione e ne cancellano la AC (causa probabile del bpm dimezzato e
+    // dell'onda sbavata). Lo facciamo DOPO che torcia ed esposizione si sono
+    // assestate (~600 ms), così congeliamo lo stato giusto. Ogni constraint è
+    // applicato singolarmente con fallback onesto se rifiutato.
+    this._ppgConstraintsTimer = setTimeout(() => {
+      this._ppgConstraintsTimer = null;
+      if (this.active) this._applyPpgConstraints();
+    }, 600);
+
     // Sonda diagnostica read-only (solo se richiesta dal consumatore).
     if (this.onDiag) this._collectDiagnostics();
+  }
+
+  // Cerca la lente ultra-grandangolo posteriore tra le camere esposte e, se
+  // trovata e diversa da quella attuale, ri-apre lo stream su quel deviceId.
+  // Fallback onesto: se non c'è o getUserMedia la rifiuta, resta sulla lente
+  // corrente. Usa getUserMedia diretto (non requestCamera) per non sporcare lo
+  // stato 'camera' dei permessi in caso di rifiuto non fatale.
+  async _maybeSwitchToUltraWide() {
+    let devs = [];
+    try { devs = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
+    const uw = devs.find(d =>
+      d.kind === 'videoinput' && d.deviceId &&
+      /ultra|grandangol/i.test(d.label) &&
+      /posterior|back|rear|environment/i.test(d.label));
+    if (!uw) return;                                    // niente ultra-wide: resta com'è
+    let cur = null;
+    try { cur = this.track && this.track.getSettings ? this.track.getSettings().deviceId : null; } catch {}
+    if (cur && cur === uw.deviceId) return;             // già su quella lente
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          deviceId: { exact: uw.deviceId },
+          width:  { ideal: 320 },
+          height: { ideal: 240 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+      });
+      for (const t of this.stream.getTracks()) t.stop();   // chiudi la vecchia lente
+      this.stream = newStream;
+      this.track = newStream.getVideoTracks()[0] || this.track;
+      this.lensSwitched = true;
+    } catch {
+      // rifiutata: teniamo lo stream attuale (fallback onesto)
+    }
+  }
+
+  // Applica i constraint utili al PPG: blocca l'AWB su 'manual' (congela il
+  // bilanciamento del bianco) e, se esposto, forza focusDistance al ravvicinato.
+  // Ogni constraint è applicato da solo: se uno è rifiutato, gli altri reggono.
+  // Registra cosa è andato a buon fine per la diagnostica.
+  async _applyPpgConstraints() {
+    if (!this.track) return;
+    let caps = {};
+    try { caps = this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch {}
+    const tries = [];
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
+      tries.push({ whiteBalanceMode: 'manual' });
+    }
+    if (caps.focusDistance && typeof caps.focusDistance.min === 'number') {
+      // fuoco ravvicinato per il dito a contatto: vicino al minimo (~0.02–0.05)
+      const fd = Math.max(caps.focusDistance.min, Math.min(0.05, caps.focusDistance.max ?? 0.05));
+      if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual')) {
+        tries.push({ focusMode: 'manual', focusDistance: fd });
+      } else {
+        tries.push({ focusDistance: fd });   // alcune implementazioni l'accettano senza focusMode
+      }
+    }
+    const applied = {};
+    for (const c of tries) {
+      try { await this.track.applyConstraints({ advanced: [c] }); Object.assign(applied, c); }
+      catch { /* fallback onesto: lascia il default per questo constraint */ }
+    }
+    this.ppgConstraintsApplied = applied;
+    // Ri-leggi la diagnostica così l'utente vede lente + settings DOPO le modifiche.
+    if (this.active && this.onDiag) this._collectDiagnostics();
   }
 
   // Read-only: NON cambia la cattura. Riporta cosa sta realmente usando la
@@ -118,6 +212,15 @@ export class PpgCapture {
         .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
     } catch {}
     if (!this.active) return;            // l'utente può aver già fermato
+    // Quale lente è realmente aperta (match deviceId → label) e cosa abbiamo
+    // bloccato: serve a verificare che sia l'ultra-grandangolo e che l'AWB lock
+    // sia passato.
+    let activeLabel = null;
+    try {
+      const did = settings && settings.deviceId;
+      const hit = did && videoInputs.find(v => v.deviceId === did);
+      activeLabel = hit ? hit.label : null;
+    } catch {}
     // Sintesi read-only dei controlli che CONTANO per l'AGC/AWB/AF: diciamo
     // esplicitamente quali sono esposti e se ammettono 'manual'/un range, così
     // i prossimi commit (lock esposizione/WB/focus) sono mirati, non a tentativi.
@@ -130,7 +233,12 @@ export class PpgCapture {
       focusDistance:        c.focusDistance || null,         // {min,max,step}
       zoom:                 c.zoom || null,                  // {min,max,step}
     };
-    if (this.onDiag) this.onDiag({ settings, capabilities, videoInputs, controls });
+    if (this.onDiag) this.onDiag({
+      settings, capabilities, videoInputs, controls,
+      activeLabel,
+      lensSwitched: this.lensSwitched,
+      ppgConstraintsApplied: this.ppgConstraintsApplied,
+    });
   }
 
   // Legge getCapabilities() sulla traccia live. Su alcuni device le capabilities
@@ -227,6 +335,7 @@ export class PpgCapture {
   stop() {
     this.active = false;
     if (this._torchTimer) { clearTimeout(this._torchTimer); this._torchTimer = null; }
+    if (this._ppgConstraintsTimer) { clearTimeout(this._ppgConstraintsTimer); this._ppgConstraintsTimer = null; }
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = null;
     // Spegni esplicitamente la torcia prima di chiudere (track.stop() la spegne
@@ -236,5 +345,6 @@ export class PpgCapture {
     if (this.video) { try { this.video.pause(); this.video.srcObject = null; } catch {} }
     this.stream = null; this.video = null; this.track = null; this.off = null; this.offCtx = null;
     this.torchAvailable = false; this.torchOn = false;
+    this.lensSwitched = false; this.ppgConstraintsApplied = null;
   }
 }

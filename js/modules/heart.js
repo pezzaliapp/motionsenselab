@@ -180,7 +180,12 @@ export function mount(container) {
       return `  ${name}: min=${r.min} max=${r.max} step=${r.step}  ← regolabile`;
     };
 
+    const applied = info.ppgConstraintsApplied;
     const lines = [
+      `lente attiva: ${info.activeLabel || '(label non disponibile)'}`,
+      `ultra-grandangolo: ${info.lensSwitched ? 'SÌ — ri-aperta ✓' : 'no (resta lente default)'}`,
+      `constraint PPG applicati: ${applied && Object.keys(applied).length ? JSON.stringify(applied) : (applied ? 'nessuno (tutti rifiutati)' : '(non ancora applicati)')}`,
+      '',
       `torch esposto: ${'torch' in caps ? caps.torch : '(assente)'}`,
       `zoom esposto:  ${'zoom' in caps ? JSON.stringify(caps.zoom) : '(assente)'}`,
       '',
