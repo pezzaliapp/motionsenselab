@@ -12,7 +12,7 @@
 //                (solo per richieste GET same-origin).
 // ============================================================================
 
-const VERSION = 'msl-v3';
+const VERSION = 'msl-v4';
 const PRECACHE = [
   './',
   './index.html',

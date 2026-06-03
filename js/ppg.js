@@ -33,9 +33,14 @@ export class PpgCapture {
   // onSample(sample) viene chiamato a ogni frame con il dito plausibile o no.
   // onTorch({available, on}) (opzionale) notifica lo stato della torcia: il
   // modulo lo usa per mostrare il toggle solo dove la torcia è davvero esposta.
-  constructor(onSample, onTorch) {
+  constructor(onSample, onTorch, onDiag) {
     this.onSample = onSample;
     this.onTorch = onTorch;
+    // onDiag(info) (opzionale, read-only): sonda diagnostica chiamata una volta
+    // a start() con { settings, capabilities, videoInputs }. Serve a verificare
+    // sul device reale QUALE lente viene aperta e se 'torch' è esposto, senza
+    // alterare in nulla la pipeline di cattura.
+    this.onDiag = onDiag;
     this.stream = null;
     this.video = null;
     this.track = null;
@@ -91,6 +96,29 @@ export class PpgCapture {
     // resettata a OFF — va accesa DOPO sulla traccia live).
     this._detectTorch();
     if (this.torchAvailable) this.setTorch(true);
+
+    // Sonda diagnostica read-only (solo se richiesta dal consumatore).
+    if (this.onDiag) this._collectDiagnostics();
+  }
+
+  // Read-only: NON cambia la cattura. Riporta cosa sta realmente usando la
+  // traccia (settings: deviceId/width/height/frameRate, facingMode se esposto),
+  // cosa dichiara capace (capabilities: torch? zoom? facingMode?) e l'elenco
+  // delle camere posteriori viste da enumerateDevices (label + deviceId), così
+  // si può capire QUALE lente è attiva e dove sta rispetto al LED.
+  async _collectDiagnostics() {
+    let settings = {}, capabilities = {};
+    try { settings = this.track && this.track.getSettings ? this.track.getSettings() : {}; } catch {}
+    try { capabilities = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch {}
+    let videoInputs = [];
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      videoInputs = devs
+        .filter(d => d.kind === 'videoinput')
+        .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
+    } catch {}
+    if (!this.active) return;            // l'utente può aver già fermato
+    if (this.onDiag) this.onDiag({ settings, capabilities, videoInputs });
   }
 
   // Legge getCapabilities() sulla traccia live. Su alcuni device le capabilities

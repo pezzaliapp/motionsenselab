@@ -67,6 +67,22 @@ export function mount(container) {
     ),
   );
 
+  // ---- Sonda diagnostica (read-only) ----
+  // Mostra cosa la fotocamera sta realmente usando: quale lente (deviceId/label),
+  // i settings della traccia e le capabilities (in particolare se 'torch' è esposto).
+  // Su iPhone non c'è una console comoda: stampiamo qui + bottone "Copia".
+  // -webkit-user-select/-webkit-touch-callout espliciti: su iOS in PWA la
+  // clipboard API spesso fallisce; così il JSON resta selezionabile a mano
+  // (long-press → Seleziona) o fotografabile, e la copia col bottone è solo un extra.
+  const diagPre = el('pre', { id: 'hDiag', style: 'white-space:pre-wrap;word-break:break-word;font-size:11px;margin:0;max-height:280px;overflow:auto;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default;background:rgba(255,255,255,.04);padding:10px;border-radius:8px' }, '— attiva la fotocamera per leggere i dati —');
+  const diagCopy = el('button', { class: 'btn ghost', type: 'button', style: 'margin-top:8px' }, 'Copia diagnostica');
+  const diagCard = el('div', { class: 'card' },
+    el('h3', {}, '🔍 Diagnostica camera (read-only)'),
+    el('p', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, 'Quale lente viene aperta, i suoi settings e se la torcia è esposta. Non altera la misura.'),
+    diagPre,
+    diagCopy,
+  );
+
   const canvas = el('canvas', { height: 140, 'aria-label': 'Onda PPG' });
   const graphCard = el('div', { class: 'card' },
     el('h3', {}, 'Forma d\'onda PPG (filtrata)'),
@@ -77,6 +93,7 @@ export function mount(container) {
   container.appendChild(intro);
   container.appendChild(controls);
   container.appendChild(bpmCard);
+  container.appendChild(diagCard);
   container.appendChild(graphCard);
 
   // ---- helpers UI ----
@@ -126,6 +143,33 @@ export function mount(container) {
     }
   }
 
+  // Riceve la sonda read-only da PpgCapture e la rende leggibile/copiabile.
+  let lastDiag = null;
+  function onDiag(info) {
+    lastDiag = info;
+    const caps = info.capabilities || {};
+    const lines = [
+      `torch esposto: ${'torch' in caps ? caps.torch : '(assente)'}`,
+      `zoom esposto:  ${'zoom' in caps ? JSON.stringify(caps.zoom) : '(assente)'}`,
+      '',
+      'settings (lente attiva):',
+      JSON.stringify(info.settings || {}, null, 2),
+      '',
+      'capabilities:',
+      JSON.stringify(caps, null, 2),
+      '',
+      `camere posteriori viste (${(info.videoInputs || []).length}):`,
+      JSON.stringify(info.videoInputs || [], null, 2),
+    ];
+    diagPre.textContent = lines.join('\n');
+  }
+  diagCopy.addEventListener('click', async () => {
+    const txt = lastDiag ? JSON.stringify(lastDiag, null, 2) : diagPre.textContent;
+    try { await navigator.clipboard.writeText(txt); diagCopy.textContent = 'Copiato ✓'; }
+    catch { diagCopy.textContent = 'Copia non riuscita — seleziona il testo'; }
+    setTimeout(() => { diagCopy.textContent = 'Copia diagnostica'; }, 1800);
+  });
+
   function resetTorchUI() {
     torchBtn.classList.add('hidden');
     torchBtn.classList.remove('ok');
@@ -135,7 +179,7 @@ export function mount(container) {
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
     rate.reset();
-    capture = new PpgCapture(onSample, onTorch);
+    capture = new PpgCapture(onSample, onTorch, onDiag);
     try {
       await capture.start();
     } catch (err) {
