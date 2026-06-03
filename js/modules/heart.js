@@ -38,6 +38,7 @@ export function mount(container) {
   // così non salta 120→75→35. Altrimenti "—" (onesto: sta ancora misurando).
   const recentRR = [];     // ultimi intervalli RR validi (ms)
   let dispBpm = 0;         // bpm visualizzato, smussato (EMA)
+  let dbgFrames = 0, dbgT0 = 0, dbgLastShow = 0;   // DEBUG temporaneo: frame rate
   const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
   function pushRR(v) {
     if (v < 333 || v > 1500) return;                 // fuori 40–180 bpm
@@ -91,10 +92,23 @@ export function mount(container) {
     el('p', { class: 'muted', style: 'font-size:12px;margin-top:8px' }, "Ogni picco corrisponde a una sistole. Se il segnale è piatto: il dito non copre la lente o c'è poca luce."),
   );
 
+  // ---- DEBUG TEMPORANEO (da rimuovere appena la misura funziona) ----
+  // Serve a vedere il segnale reale sul device: livelli del canale rosso,
+  // ampiezza della componente cardiaca (AC), saturazione, frame rate effettivo
+  // e gli intervalli RR raccolti. È così che si capisce se "onda frastagliata"
+  // = rumore (AC alta ma irregolare), saturazione (R≈255) o frame duplicati.
+  const dbgPre = el('pre', { id: 'hDbg', style: 'white-space:pre-wrap;font-size:11px;margin:0;background:rgba(255,255,255,.04);padding:10px;border-radius:8px;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default' }, '— attiva e appoggia il dito —');
+  const dbgCard = el('div', { class: 'card' },
+    el('h3', {}, '🛠️ Debug temporaneo'),
+    el('p', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, 'Diagnostica provvisoria: incolla questi valori per chiudere il problema. Verrà rimossa.'),
+    dbgPre,
+  );
+
   container.appendChild(intro);
   container.appendChild(controls);
   container.appendChild(bpmCard);
   container.appendChild(graphCard);
+  container.appendChild(dbgCard);
 
   // ---- helpers UI ----
   function setText(sel, txt) {
@@ -114,6 +128,22 @@ export function mount(container) {
   // alimentiamo il buffer RR filtrato. Il rendering del grafico e dei bpm qui.
   function onSample(s) {
     setBadge('#hLight', s.fingerOk ? 'dito rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
+
+    // DEBUG TEMPORANEO: misura il frame rate effettivo e mostra i livelli reali.
+    dbgFrames++;
+    if (dbgT0 === 0) dbgT0 = s.ts;
+    if (s.ts - dbgLastShow > 1000) {
+      const hz = (dbgFrames * 1000 / (s.ts - dbgT0)) || 0;
+      const lastRR = recentRR.slice(-6).map(v => Math.round(v)).join(', ') || '—';
+      dbgPre.textContent =
+        `frame rate: ${hz.toFixed(1)} Hz   (atteso ~30)\n` +
+        `meanR=${s.meanR.toFixed(1)}  meanG=${s.meanG.toFixed(1)}  meanB=${s.meanB.toFixed(1)}\n` +
+        `saturazione R≥250: ${(s.satPct * 100).toFixed(1)}%${s.satPct > 0.5 ? '  ← CLIPPING' : ''}\n` +
+        `ampiezza AC (qualità): ${s.quality.toFixed(3)}   dito: ${s.fingerOk ? 'sì' : 'no'}\n` +
+        `RR raccolti: ${recentRR.length}/8   ultimi: [${lastRR}] ms\n` +
+        `bpm mostrato: ${dispBpm ? Math.round(dispBpm) : '—'}`;
+      dbgLastShow = s.ts;
+    }
 
     if (s.fingerOk && s.isPeak && s.intervalMs > 0) pushRR(s.intervalMs);
     // Dito assente per davvero: butta la storia, così al rientro si riparte pulito.
@@ -168,6 +198,7 @@ export function mount(container) {
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
     recentRR.length = 0; dispBpm = 0;
+    dbgFrames = 0; dbgT0 = 0; dbgLastShow = 0;
     setText('#hBpm', '—');
     capture = new PpgCapture(onSample, onTorch);
     try {

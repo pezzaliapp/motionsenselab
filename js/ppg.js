@@ -82,6 +82,7 @@ export class PpgCapture {
     this.quality = 0;
     this.fingerLost = 0;   // frame consecutivi senza dito (per la resettatura ritardata)
     this.fingerWas = false; // stato dito precedente (isteresi anti-sfarfallio)
+    this._lastProcTs = 0;  // ultimo frame elaborato (throttle ~30 Hz)
   }
 
   // Buffer del segnale filtrato (per il grafico live nel consumatore).
@@ -112,7 +113,7 @@ export class PpgCapture {
     this.offCtx = this.off.getContext('2d', { willReadFrequently: true });
 
     this.bp.reset(); this.peaks.reset(); this.filtBuf.clear();
-    this.lastTs = 0; this.quality = 0; this.fingerLost = 0; this.fingerWas = false;
+    this.lastTs = 0; this.quality = 0; this.fingerLost = 0; this.fingerWas = false; this._lastProcTs = 0;
     this.active = true;
     this.rafId = requestAnimationFrame(() => this._loop());
 
@@ -253,6 +254,15 @@ export class PpgCapture {
 
   _loop() {
     if (!this.active) return;
+    this.rafId = requestAnimationFrame(() => this._loop());   // schedula sempre il prossimo
+    // Throttle a ~30 Hz: su display ProMotion (120 Hz) rAF gira 4× più veloce
+    // dei 30 fps del video, quindi rielaboreremmo LO STESSO frame video più
+    // volte → gradini/duplicati nel filtro → onda frastagliata e SNR rovinato.
+    // Campionando a ~30 Hz prendiamo (circa) un frame nuovo ogni volta.
+    const tNow = performance.now();
+    if (tNow - this._lastProcTs < 30) return;
+    this._lastProcTs = tNow;
+
     const video = this.video;
     if (video && video.readyState >= 2) {
       this.offCtx.drawImage(video, 0, 0, PROC_W, PROC_H);
@@ -314,7 +324,6 @@ export class PpgCapture {
         this.onSample({ meanR, meanG, meanB, satPct, fingerOk, filt, quality: this.quality, isPeak, intervalMs, ts: now });
       }
     }
-    this.rafId = requestAnimationFrame(() => this._loop());
   }
 
   stop() {
