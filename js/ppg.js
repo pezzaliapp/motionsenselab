@@ -1,109 +1,97 @@
 // ============================================================================
-// ppg.js — motore di cattura PPG condiviso (fotopletismografia da fotocamera).
+// ppg.js — motore di cattura PPG (fotopletismografia da fotocamera).
 //
-// Estrae la pipeline che prima viveva dentro heart.js, così sia il modulo
-// "Battito" sia il modulo "Stress (HRV)" usano la STESSA acquisizione senza
-// duplicarla. La pipeline è invariata rispetto a heart.js:
-//   1) video → drawImage su canvas off-screen 160×120
-//   2) media del canale rosso su ROI centrale 80×80
-//   3) passa-banda 0.9–4 Hz (≈54–240 bpm)
-//   4) peak detector adattivo (refrattarietà 300 ms + isteresi) → RR (≈battiti)
-//   5) stima di qualità grossolana (ampiezza del filtrato)
+// Riscrittura completa, robusta al rumore. Differenze chiave rispetto al primo
+// approccio "conta i picchi" (fragile sul segnale reale, frastagliato):
 //
-// Il consumatore riceve, per ogni frame, un oggetto sample con il risultato
-// (filt, fingerOk, quality, isPeak, intervalMs) e decide cosa farne:
-//   - heart.js  → RateEstimator → bpm
-//   - stress.js → serie di RR → HRV (RMSSD) → indice di stress
+//  1) CAMPIONAMENTO PULITO: usa requestVideoFrameCallback (un callback per
+//     fotogramma video reale) invece di requestAnimationFrame. Su display
+//     ProMotion (120 Hz) rAF girava 4× più veloce dei 30 fps del video e
+//     rielaborava lo STESSO frame → gradini nel filtro → onda frastagliata.
+//     Fallback: rAF con throttle a ~30 Hz dove rVFC non c'è.
 //
-// Torcia: da iOS 17+ (e Android Chrome) è controllabile via track constraints
-// se getCapabilities() espone 'torch' — vedi setTorch()/_detectTorch(). Dove
-// non è esposta (iOS ≤16, fotocamera senza flash) si ricade su buona luce
-// ambientale. In ogni caso serve il dito FERMO sulla lente.
+//  2) STIMA BPM PER AUTOCORRELAZIONE: la frequenza si stima trovando la
+//     periodicità dominante del segnale filtrato su una finestra di ~8 s, non
+//     contando i singoli picchi. Il rumore si de-correla → è molto più robusto.
+//     Si prende il PRIMO massimo locale "forte" dell'autocorrelazione (la
+//     fondamentale), evitando gli errori di ottava (mezzo/doppio bpm).
+//     L'altezza del picco di autocorrelazione è una CONFIDENZA onesta (0..1):
+//     se non c'è un vero battito periodico resta bassa → la UI mostra "—".
+//
+//  3) Mantiene un peak detector per gli intervalli RR, usati dal modulo Stress
+//     (HRV): l'autocorrelazione dà la frequenza, non i singoli RR.
+//
+// Validato in simulazione su PPG realistico (48–135 bpm) con rumore forte,
+// deriva respiratoria e ampiezza variabile: la frequenza torna corretta e la
+// confidenza distingue il segnale vero dal rumore. Va comunque provato sul
+// device — la simulazione non sostituisce la prova reale.
 // ============================================================================
 
 import { RingBuffer, BandPass, PeakDetector } from './utils.js';
 import { requestCamera } from './permissions.js';
 
-const ROI_SIZE = 80;              // ROI 80×80 al centro del frame
-const PROC_W = 160, PROC_H = 120; // canvas off-screen
-const WINDOW_S = 8;
-const SAMPLE_HZ = 30;             // frame rate video tipico
+const ROI_SIZE = 80;               // ROI 80×80 al centro del frame
+const PROC_W = 160, PROC_H = 120;  // canvas off-screen
+const WINDOW_S = 8;                // finestra per l'autocorrelazione
+const TARGET_HZ = 30;              // frame rate video tipico
+const EST_EVERY_MS = 400;          // ogni quanto ricalcolare la stima
+const HR_MIN = 40, HR_MAX = 180;   // banda fisiologica ammessa
 
 export class PpgCapture {
-  // onSample(sample) viene chiamato a ogni frame con il dito plausibile o no.
-  // onTorch({available, on}) (opzionale) notifica lo stato della torcia: il
-  // modulo lo usa per mostrare il toggle solo dove la torcia è davvero esposta.
-  constructor(onSample, onTorch, onDiag) {
+  // onSample(sample): chiamato a ogni frame con
+  //   { meanR, meanG, meanB, fingerOk, filt, quality, isPeak, intervalMs,
+  //     bpm, conf, fps, ts }
+  //   - bpm/conf: frequenza stimata (autocorrelazione) e confidenza 0..1 → heart.js
+  //   - isPeak/intervalMs: battiti per gli RR → stress.js
+  // onTorch({available, on}): stato torcia (toggle in UI solo dove esposta).
+  constructor(onSample, onTorch) {
     this.onSample = onSample;
     this.onTorch = onTorch;
-    // onDiag(info) (opzionale, read-only): sonda diagnostica chiamata una volta
-    // a start() con { settings, capabilities, videoInputs }. Serve a verificare
-    // sul device reale QUALE lente viene aperta e se 'torch' è esposto, senza
-    // alterare in nulla la pipeline di cattura.
-    this.onDiag = onDiag;
-    this.stream = null;
-    this.video = null;
-    this.track = null;
-    this.off = null;
-    this.offCtx = null;
+    this.stream = null; this.video = null; this.track = null;
+    this.off = null; this.offCtx = null;
     this.active = false;
     this.rafId = null;
     this.lastTs = 0;
+    this._lastProc = 0;            // throttle del fallback rAF
+    this._lastEst = 0;
 
-    // Torcia: controllabile da iOS 17+ e Android Chrome via track constraints,
-    // ma SOLO se getCapabilities() espone 'torch' (camera posteriore con flash).
-    this.torchAvailable = false;
-    this.torchOn = false;
-    this._torchTimer = null;
+    // Torcia (iOS 17+/Android via track constraints, se getCapabilities la espone)
+    this.torchAvailable = false; this.torchOn = false; this._torchTimer = null;
+    this.ppgConstraintsApplied = null; this._ppgTimer = null;
 
-    // Constraints PPG (vedi _applyPpgConstraints): sulla fotocamera posteriore
-    // di default blocchiamo l'AWB e proviamo il fuoco ravvicinato. NON cambiamo
-    // lente: la principale è co-locata con la torcia (vedi start).
-    this.lensSwitched = false;          // mantenuto per la sonda diagnostica (sempre false ora)
-    this.ppgConstraintsApplied = null;  // { whiteBalanceMode?, focusDistance?, ... }
-    this._ppgConstraintsTimer = null;
-
-    // Banda PPG 0.9–4 Hz. Pavimento ~0.9 Hz ≈ 54 bpm: attenua la deriva lenta
-    // (respiro/movimento) che sollevava la baseline; sotto i 54 bpm il bpm va
-    // considerato inaffidabile (accettabile, a riposo si sta sopra).
-    this.bp = new BandPass(0.9, 4.0);
-    // Rilevatore picchi NORMALIZZATO (vedi PeakDetector.envelope): il segnale
-    // viene diviso per un inviluppo lento della sua ampiezza, così ogni battito
-    // — grande o piccolo — diventa ~unitario e una soglia fissa li prende tutti.
-    // Risolve il bpm dimezzato (42–46 invece di ~85) causato dall'ampiezza che
-    // varia battito-battito (AGC/respiro). Parametri validati in simulazione su
-    // 60–115 bpm con AGC 2:1, deriva, dicrota e rumore lieve. Refrattarietà
-    // 350 ms ≈ max 170 bpm: margine pieno fino a 110 bpm, no doppio conteggio.
+    // Banda PPG 0.7–3.5 Hz (≈42–210 bpm): più larga in basso per non perdere il
+    // fondamentale a riposo, low-pass a 3.5 per togliere rumore alto.
+    this.bp = new BandPass(0.7, 3.5);
+    // Peak detector (solo per gli RR di Stress): soglia su inviluppo normalizzato.
     this.peaks = new PeakDetector({
       minIntervalMs: 350,
       envelope: { thr: 0.5, reArm: -0.25, aEnv: 0.04, minEnv: 0.08, aSmooth: 0.5 },
     });
-    this.filtBuf = new RingBuffer(SAMPLE_HZ * WINDOW_S);
+
+    this.filtBuf = new RingBuffer(TARGET_HZ * WINDOW_S);  // grafico live
+    this.win = [];                // { v, t } finestra mobile per l'autocorrelazione
     this.quality = 0;
-    this.fingerLost = 0;   // frame consecutivi senza dito (per la resettatura ritardata)
-    this.fingerWas = false; // stato dito precedente (isteresi anti-sfarfallio)
-    this._lastProcTs = 0;  // ultimo frame elaborato (throttle ~30 Hz)
+    this.fingerLost = 0;
+    this.fingerWas = false;
+
+    this.bpm = 0;                 // bpm visualizzato (mediana + smoothing)
+    this.conf = 0;                // confidenza 0..1 dell'ultima stima
+    this.fps = TARGET_HZ;
+    this.bpmHist = [];            // ultime stime accettate (mediana anti-glitch)
+    this.bpmSmooth = 0;
   }
 
-  // Buffer del segnale filtrato (per il grafico live nel consumatore).
   filtered() { return this.filtBuf.toArray(); }
 
   async start() {
-    this.lensSwitched = false;
-    this.ppgConstraintsApplied = null;
-    this.stream = await requestCamera();   // può rilanciare: gestito dal chiamante
+    this.stream = await requestCamera();
     this.track = this.stream.getVideoTracks()[0] || null;
 
-    // NB: usiamo la fotocamera posteriore di DEFAULT (la principale), che su
-    // iPhone è co-locata con il LED/torcia: col dito a contatto è quella
-    // illuminata correttamente. NON forziamo l'ultra-grandangolo: su 15 Pro Max
-    // è lontano dalla torcia → dito mal illuminato, rilevamento intermittente e
-    // segnale pessimo (regressione osservata sul device).
-
+    // Fotocamera posteriore di DEFAULT (la principale): è co-locata con il LED/
+    // torcia, quindi col dito a contatto è quella illuminata correttamente. NON
+    // forziamo l'ultra-grandangolo (lontano dalla torcia → dito mal illuminato).
     const video = document.createElement('video');
-    video.playsInline = true;
-    video.muted = true;
-    video.autoplay = true;
+    video.playsInline = true; video.muted = true; video.autoplay = true;
     video.srcObject = this.stream;
     try { await video.play(); } catch {}
     this.video = video;
@@ -113,113 +101,181 @@ export class PpgCapture {
     this.offCtx = this.off.getContext('2d', { willReadFrequently: true });
 
     this.bp.reset(); this.peaks.reset(); this.filtBuf.clear();
-    this.lastTs = 0; this.quality = 0; this.fingerLost = 0; this.fingerWas = false; this._lastProcTs = 0;
+    this.win = []; this.bpmHist = []; this.bpmSmooth = 0; this.bpm = 0; this.conf = 0;
+    this.lastTs = 0; this._lastProc = 0; this._lastEst = 0;
+    this.quality = 0; this.fingerLost = 0; this.fingerWas = false;
     this.active = true;
-    this.rafId = requestAnimationFrame(() => this._loop());
 
-    // Torcia: rileva e, se disponibile, accendi (getUserMedia l'ha appena
-    // resettata a OFF — va accesa DOPO sulla traccia live).
+    this._startSampling();
+
+    // Torcia: rileva e accendi (getUserMedia la resetta a OFF → accendi DOPO).
     this._detectTorch();
     if (this.torchAvailable) this.setTorch(true);
 
-    // Blocca l'AWB (whiteBalanceMode 'manual') e, se possibile, forza il fuoco
-    // ravvicinato. L'auto-white-balance/auto-exposure altrimenti "inseguono" la
-    // pulsazione e ne cancellano la AC (causa probabile del bpm dimezzato e
-    // dell'onda sbavata). Lo facciamo DOPO che torcia ed esposizione si sono
-    // assestate (~600 ms), così congeliamo lo stato giusto. Ogni constraint è
-    // applicato singolarmente con fallback onesto se rifiutato.
-    this._ppgConstraintsTimer = setTimeout(() => {
-      this._ppgConstraintsTimer = null;
+    // Blocca l'AWB (e prova il fuoco ravvicinato) dopo che torcia/esposizione si
+    // assestano: l'auto-white-balance altrimenti "insegue" la pulsazione e la
+    // attenua. Ogni constraint applicato singolarmente, fallback onesto.
+    this._ppgTimer = setTimeout(() => {
+      this._ppgTimer = null;
       if (this.active) this._applyPpgConstraints();
     }, 600);
-
-    // Sonda diagnostica read-only (solo se richiesta dal consumatore).
-    if (this.onDiag) this._collectDiagnostics();
   }
 
-  // Applica i constraint utili al PPG: blocca l'AWB su 'manual' (congela il
-  // bilanciamento del bianco) e, se esposto, forza focusDistance al ravvicinato.
-  // Ogni constraint è applicato da solo: se uno è rifiutato, gli altri reggono.
-  // Registra cosa è andato a buon fine per la diagnostica.
-  async _applyPpgConstraints() {
-    if (!this.track) return;
-    let caps = {};
-    try { caps = this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch {}
-    const tries = [];
-    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
-      tries.push({ whiteBalanceMode: 'manual' });
+  // Campionamento: un frame video reale per callback (rVFC) → niente duplicati.
+  _startSampling() {
+    const v = this.video;
+    if (v && typeof v.requestVideoFrameCallback === 'function') {
+      const cb = () => { if (!this.active) return; this._frame(); v.requestVideoFrameCallback(cb); };
+      v.requestVideoFrameCallback(cb);
+    } else {
+      const loop = () => {
+        if (!this.active) return;
+        this.rafId = requestAnimationFrame(loop);
+        const now = performance.now();
+        if (now - this._lastProc < 30) return;   // throttle ~30 Hz (anti frame duplicati)
+        this._lastProc = now;
+        this._frame();
+      };
+      this.rafId = requestAnimationFrame(loop);
     }
-    if (caps.focusDistance && typeof caps.focusDistance.min === 'number') {
-      // fuoco ravvicinato per il dito a contatto: vicino al minimo (~0.02–0.05)
-      const fd = Math.max(caps.focusDistance.min, Math.min(0.05, caps.focusDistance.max ?? 0.05));
-      if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual')) {
-        tries.push({ focusMode: 'manual', focusDistance: fd });
-      } else {
-        tries.push({ focusDistance: fd });   // alcune implementazioni l'accettano senza focusMode
-      }
-    }
-    const applied = {};
-    for (const c of tries) {
-      try { await this.track.applyConstraints({ advanced: [c] }); Object.assign(applied, c); }
-      catch { /* fallback onesto: lascia il default per questo constraint */ }
-    }
-    this.ppgConstraintsApplied = applied;
-    // Ri-leggi la diagnostica così l'utente vede lente + settings DOPO le modifiche.
-    if (this.active && this.onDiag) this._collectDiagnostics();
   }
 
-  // Read-only: NON cambia la cattura. Riporta cosa sta realmente usando la
-  // traccia (settings: deviceId/width/height/frameRate, facingMode se esposto),
-  // cosa dichiara capace (capabilities: torch? zoom? facingMode?) e l'elenco
-  // delle camere posteriori viste da enumerateDevices (label + deviceId), così
-  // si può capire QUALE lente è attiva e dove sta rispetto al LED.
-  async _collectDiagnostics() {
-    let settings = {}, capabilities = {};
-    try { settings = this.track && this.track.getSettings ? this.track.getSettings() : {}; } catch {}
-    try { capabilities = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch {}
-    let videoInputs = [];
-    try {
-      const devs = await navigator.mediaDevices.enumerateDevices();
-      videoInputs = devs
-        .filter(d => d.kind === 'videoinput')
-        .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
-    } catch {}
-    if (!this.active) return;            // l'utente può aver già fermato
-    // Quale lente è realmente aperta (match deviceId → label) e cosa abbiamo
-    // bloccato: serve a verificare che sia l'ultra-grandangolo e che l'AWB lock
-    // sia passato.
-    let activeLabel = null;
-    try {
-      const did = settings && settings.deviceId;
-      const hit = did && videoInputs.find(v => v.deviceId === did);
-      activeLabel = hit ? hit.label : null;
-    } catch {}
-    // Sintesi read-only dei controlli che CONTANO per l'AGC/AWB/AF: diciamo
-    // esplicitamente quali sono esposti e se ammettono 'manual'/un range, così
-    // i prossimi commit (lock esposizione/WB/focus) sono mirati, non a tentativi.
-    const c = capabilities || {};
-    const controls = {
-      exposureMode:         c.exposureMode || null,          // es. ['continuous','manual']
-      focusMode:            c.focusMode || null,             // es. ['continuous','manual']
-      whiteBalanceMode:     c.whiteBalanceMode || null,      // es. ['continuous','manual']
-      exposureCompensation: c.exposureCompensation || null,  // {min,max,step}
-      focusDistance:        c.focusDistance || null,         // {min,max,step}
-      zoom:                 c.zoom || null,                  // {min,max,step}
-    };
-    if (this.onDiag) this.onDiag({
-      settings, capabilities, videoInputs, controls,
-      activeLabel,
-      lensSwitched: this.lensSwitched,
-      ppgConstraintsApplied: this.ppgConstraintsApplied,
-    });
+  _frame() {
+    const video = this.video;
+    if (!video || video.readyState < 2) return;
+    this.offCtx.drawImage(video, 0, 0, PROC_W, PROC_H);
+    const sx = (PROC_W - ROI_SIZE) >> 1, sy = (PROC_H - ROI_SIZE) >> 1;
+    const img = this.offCtx.getImageData(sx, sy, ROI_SIZE, ROI_SIZE).data;
+
+    let sumR = 0, sumG = 0, sumB = 0, satCount = 0;
+    const n = ROI_SIZE * ROI_SIZE;
+    for (let i = 0; i < img.length; i += 4) {
+      const R = img[i];
+      sumR += R; sumG += img[i + 1]; sumB += img[i + 2];
+      if (R >= 250) satCount++;
+    }
+    const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+    const satPct = satCount / n;
+
+    // Dito appoggiato (rosso domina) con ISTERESI anti-sfarfallio: una volta
+    // agganciato si mantiene con soglie più morbide, così la pulsazione stessa
+    // non lo fa "perdere" per qualche frame.
+    const acquire  = meanR > 55 && meanR > meanG * 1.15 && meanR > meanB * 1.15;
+    const maintain = meanR > 45 && meanR > meanG * 1.05 && meanR > meanB * 1.05;
+    const fingerOk = this.fingerWas ? maintain : acquire;
+    this.fingerWas = fingerOk;
+
+    const now = performance.now();
+    const dt = this.lastTs ? (now - this.lastTs) / 1000 : 1 / TARGET_HZ;
+    this.lastTs = now;
+
+    const filt = this.bp.step(meanR, dt);
+    this.filtBuf.push(filt);
+
+    // Qualità grezza ≈ ampiezza del filtrato (per il gate RR di Stress).
+    const arr = this.filtBuf.toArray();
+    if (arr.length > 30) {
+      let mean = 0; for (let i = 0; i < arr.length; i++) mean += arr[i]; mean /= arr.length;
+      let varr = 0; for (let i = 0; i < arr.length; i++) varr += (arr[i] - mean) * (arr[i] - mean);
+      this.quality = Math.min(1, Math.sqrt(varr / arr.length) / 2);
+    }
+
+    // RR per Stress (peak detector). Reset solo dopo perdita SOSTENUTA del dito.
+    let isPeak = false, intervalMs = 0;
+    if (fingerOk) {
+      this.fingerLost = 0;
+      const r = this.peaks.step(filt, now);
+      isPeak = r.isPeak; intervalMs = r.intervalMs;
+      this.win.push({ v: filt, t: now });
+    } else {
+      if (++this.fingerLost > 20) { this.peaks.reset(); this.win = []; this.bpm = 0; this.conf = 0; this.bpmHist = []; this.bpmSmooth = 0; }
+    }
+
+    // Finestra mobile di ~WINDOW_S secondi per l'autocorrelazione.
+    const cutoff = now - WINDOW_S * 1000;
+    while (this.win.length && this.win[0].t < cutoff) this.win.shift();
+
+    // Stima periodica della frequenza.
+    if (fingerOk && now - this._lastEst > EST_EVERY_MS) {
+      this._lastEst = now;
+      this._estimate();
+    }
+
+    if (this.onSample) {
+      this.onSample({
+        meanR, meanG, meanB, satPct, fingerOk, filt, quality: this.quality,
+        isPeak, intervalMs, bpm: this.bpmSmooth, conf: this.conf, fps: this.fps, ts: now,
+      });
+    }
   }
 
-  // Legge getCapabilities() sulla traccia live. Su alcuni device le capabilities
-  // si popolano con lieve ritardo → un singolo re-check dopo 500 ms.
+  // Stima della frequenza per autocorrelazione del segnale filtrato sulla
+  // finestra mobile. Ritorna periodicità dominante (bpm) e confidenza (0..1).
+  _estimate() {
+    const w = this.win;
+    const N = w.length;
+    if (N < TARGET_HZ * 3) { this.conf = 0; return; }   // servono ≥3 s
+
+    const dur = (w[N - 1].t - w[0].t) / 1000;
+    if (dur <= 0) { this.conf = 0; return; }
+    const fps = (N - 1) / dur;
+    this.fps = fps;
+
+    // Centra e calcola la varianza.
+    const y = new Float64Array(N);
+    let mean = 0; for (let i = 0; i < N; i++) { y[i] = w[i].v; mean += y[i]; } mean /= N;
+    let varr = 0; for (let i = 0; i < N; i++) { y[i] -= mean; varr += y[i] * y[i]; } varr /= N;
+    if (varr < 1e-9) { this.conf = 0; return; }
+
+    const minLag = Math.max(2, Math.floor(fps * 60 / HR_MAX));
+    const maxLag = Math.min(N - 2, Math.ceil(fps * 60 / HR_MIN));
+    if (maxLag <= minLag + 1) { this.conf = 0; return; }
+
+    // Autocorrelazione NON distorta (media sull'overlap / varianza), precalcolata.
+    const ac = new Float64Array(maxLag + 2);
+    for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
+      if (lag < 1) continue;
+      let s = 0; const m = N - lag;
+      for (let i = 0; i < m; i++) s += y[i] * y[i + lag];
+      ac[lag] = (s / m) / varr;
+    }
+
+    // Massimi locali; la fondamentale è il massimo locale a lag più CORTO la cui
+    // forza è ≥ 60% del massimo (evita di agganciare 2×periodo → bpm dimezzato).
+    let maxR = -Infinity; const locals = [];
+    for (let lag = minLag + 1; lag <= maxLag - 1; lag++) {
+      const r = ac[lag];
+      if (r > ac[lag - 1] && r >= ac[lag + 1]) { locals.push(lag); if (r > maxR) maxR = r; }
+    }
+    if (!locals.length || maxR <= 0) { this.conf = 0; return; }
+    let fund = locals[0];
+    for (const lag of locals) { if (ac[lag] >= 0.6 * maxR) { fund = lag; break; } }
+
+    // Interpolazione parabolica per il sub-campione.
+    const r0 = ac[fund - 1], r1 = ac[fund], r2 = ac[fund + 1];
+    let lag = fund; const den = r0 - 2 * r1 + r2; if (den < 0) lag = fund + 0.5 * (r0 - r2) / den;
+    const bpm = 60 * fps / lag;
+    const conf = Math.max(0, Math.min(1, r1));
+    this.conf = conf;
+    if (bpm < HR_MIN || bpm > HR_MAX) return;
+    this.bpm = bpm;
+
+    // Smoothing temporale: mediana delle ultime stime (anti-glitch d'ottava) +
+    // EMA. Si aggiorna solo con confidenza decente, così un colpo di rumore non
+    // sposta il numero mostrato.
+    if (conf >= 0.45) {
+      this.bpmHist.push(bpm);
+      if (this.bpmHist.length > 5) this.bpmHist.shift();
+      const sorted = [...this.bpmHist].sort((a, b) => a - b);
+      const med = sorted[Math.floor(sorted.length / 2)];
+      this.bpmSmooth = this.bpmSmooth ? this.bpmSmooth * 0.7 + med * 0.3 : med;
+    }
+  }
+
+  // ---- Torcia ----
   _detectTorch() {
     let caps = {};
-    try { caps = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {}; }
-    catch { caps = {}; }
+    try { caps = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch { caps = {}; }
     this.torchAvailable = !!caps.torch;
     if (this.onTorch) this.onTorch({ available: this.torchAvailable, on: this.torchOn });
     if (!this.torchAvailable && !this._torchTimer) {
@@ -229,17 +285,12 @@ export class PpgCapture {
         try { caps = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch { caps = {}; }
         const was = this.torchAvailable;
         this.torchAvailable = !!caps.torch;
-        if (this.torchAvailable && !was) {
-          this.setTorch(true);                       // accendi appena diventa disponibile
-        } else if (this.onTorch) {
-          this.onTorch({ available: this.torchAvailable, on: this.torchOn });
-        }
+        if (this.torchAvailable && !was) this.setTorch(true);
+        else if (this.onTorch) this.onTorch({ available: this.torchAvailable, on: this.torchOn });
       }, 500);
     }
   }
 
-  // Accende/spegne la torcia. Ritorna true se applicato. No-op onesto quando
-  // 'torch' non è esposto (iOS ≤16, fotocamera senza flash, browser non supportati).
   async setTorch(on) {
     if (!this.track || !this.torchAvailable) return false;
     try {
@@ -247,98 +298,41 @@ export class PpgCapture {
       this.torchOn = !!on;
       if (this.onTorch) this.onTorch({ available: true, on: this.torchOn });
       return true;
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
-  _loop() {
-    if (!this.active) return;
-    this.rafId = requestAnimationFrame(() => this._loop());   // schedula sempre il prossimo
-    // Throttle a ~30 Hz: su display ProMotion (120 Hz) rAF gira 4× più veloce
-    // dei 30 fps del video, quindi rielaboreremmo LO STESSO frame video più
-    // volte → gradini/duplicati nel filtro → onda frastagliata e SNR rovinato.
-    // Campionando a ~30 Hz prendiamo (circa) un frame nuovo ogni volta.
-    const tNow = performance.now();
-    if (tNow - this._lastProcTs < 30) return;
-    this._lastProcTs = tNow;
-
-    const video = this.video;
-    if (video && video.readyState >= 2) {
-      this.offCtx.drawImage(video, 0, 0, PROC_W, PROC_H);
-      const sx = (PROC_W - ROI_SIZE) >> 1;
-      const sy = (PROC_H - ROI_SIZE) >> 1;
-      const img = this.offCtx.getImageData(sx, sy, ROI_SIZE, ROI_SIZE).data;
-
-      let sumR = 0, sumG = 0, sumB = 0, satCount = 0;
-      const n = ROI_SIZE * ROI_SIZE;
-      for (let i = 0; i < img.length; i += 4) {
-        const R = img[i];
-        sumR += R; sumG += img[i + 1]; sumB += img[i + 2];
-        if (R >= 250) satCount++;        // diagnostica: pixel col rosso a fondo scala (clipping)
-      }
-      const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
-      const satPct = satCount / n;       // 0..1: frazione della ROI col rosso saturo
-
-      // Dito ben appoggiato: il rosso domina su verde/blu. ISTERESI: una volta
-      // rilevato il dito, lo si "mantiene" con soglie più morbide. Senza questo,
-      // la stessa pulsazione PPG (che fa oscillare meanR) può far scendere il
-      // segnale sotto la soglia di acquisizione per qualche frame → fingerOk
-      // sfarfalla → il rilevatore si azzera di continuo → bpm fermo su "—".
-      const acquire  = meanR > 55 && meanR > meanG * 1.15 && meanR > meanB * 1.15;
-      const maintain = meanR > 45 && meanR > meanG * 1.05 && meanR > meanB * 1.05;
-      const fingerOk = this.fingerWas ? maintain : acquire;
-      this.fingerWas = fingerOk;
-
-      const now = performance.now();
-      const dt = this.lastTs ? (now - this.lastTs) / 1000 : 1 / SAMPLE_HZ;
-      this.lastTs = now;
-
-      const filt = this.bp.step(meanR, dt);
-      this.filtBuf.push(filt);
-
-      // Qualità ≈ ampiezza del filtrato (std), normalizzata in 0..1.
-      const arr = this.filtBuf.toArray();
-      if (arr.length > 30) {
-        let mean = 0; for (let i = 0; i < arr.length; i++) mean += arr[i]; mean /= arr.length;
-        let varr = 0; for (let i = 0; i < arr.length; i++) varr += (arr[i] - mean) * (arr[i] - mean);
-        varr /= arr.length;
-        this.quality = Math.min(1, Math.sqrt(varr) / 2);
-      }
-
-      let isPeak = false, intervalMs = 0;
-      if (fingerOk) {
-        // NON resettare il rilevatore a ogni micro-buco: un drop-out transitorio
-        // azzererebbe inviluppo/ritmo e — con dito un po' ballerino — impedirebbe
-        // del tutto il conteggio (bpm "—"). Reset solo dopo perdita SOSTENUTA
-        // (~0.7 s). L'eventuale RR spurio al rientro è scartato dal filtro
-        // outlier nel consumatore (heart.js / stress.js).
-        this.fingerLost = 0;
-        const r = this.peaks.step(filt, now);
-        isPeak = r.isPeak; intervalMs = r.intervalMs;
-      } else {
-        if (++this.fingerLost > 20) this.peaks.reset();
-      }
-
-      if (this.onSample) {
-        this.onSample({ meanR, meanG, meanB, satPct, fingerOk, filt, quality: this.quality, isPeak, intervalMs, ts: now });
-      }
+  // Blocca l'AWB su 'manual' e, se esposto, forza il fuoco ravvicinato. Ogni
+  // constraint da solo: un rifiuto non blocca gli altri (fallback onesto).
+  async _applyPpgConstraints() {
+    if (!this.track) return;
+    let caps = {};
+    try { caps = this.track.getCapabilities ? this.track.getCapabilities() : {}; } catch {}
+    const tries = [];
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
+      tries.push({ whiteBalanceMode: 'manual' });
     }
+    if (caps.focusDistance && typeof caps.focusDistance.min === 'number') {
+      const fd = Math.max(caps.focusDistance.min, Math.min(0.05, caps.focusDistance.max ?? 0.05));
+      if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual')) tries.push({ focusMode: 'manual', focusDistance: fd });
+      else tries.push({ focusDistance: fd });
+    }
+    const applied = {};
+    for (const c of tries) {
+      try { await this.track.applyConstraints({ advanced: [c] }); Object.assign(applied, c); } catch {}
+    }
+    this.ppgConstraintsApplied = applied;
   }
 
   stop() {
     this.active = false;
     if (this._torchTimer) { clearTimeout(this._torchTimer); this._torchTimer = null; }
-    if (this._ppgConstraintsTimer) { clearTimeout(this._ppgConstraintsTimer); this._ppgConstraintsTimer = null; }
+    if (this._ppgTimer) { clearTimeout(this._ppgTimer); this._ppgTimer = null; }
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = null;
-    // Spegni esplicitamente la torcia prima di chiudere (track.stop() la spegne
-    // comunque, ma essere espliciti evita flash "appesi" su alcuni device).
     if (this.track && this.torchOn) { try { this.track.applyConstraints({ advanced: [{ torch: false }] }); } catch {} }
     if (this.stream) { for (const t of this.stream.getTracks()) t.stop(); }
     if (this.video) { try { this.video.pause(); this.video.srcObject = null; } catch {} }
     this.stream = null; this.video = null; this.track = null; this.off = null; this.offCtx = null;
     this.torchAvailable = false; this.torchOn = false;
-    this.lensSwitched = false; this.ppgConstraintsApplied = null;
   }
 }

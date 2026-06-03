@@ -1,182 +1,119 @@
 // ============================================================================
 // heart.js — Modulo "Battito cardiaco" (PPG ottica).
 //
-// Principio fisico (fotopletismografia):
-//   Il sangue ossigenato assorbe maggiormente la luce verde/rossa rispetto
-//   al tessuto. Quando il cuore pompa, il volume di sangue capillare al
-//   polpastrello aumenta brevemente → l'intensità della luce trasmessa
-//   diminuisce di un piccolo ΔI. Posando il dito sulla lente, la camera
-//   "vede" la pulsazione come una piccola modulazione del canale rosso.
+// Principio (fotopletismografia): col polpastrello sulla fotocamera posteriore
+// e la torcia accesa, il volume di sangue capillare modula la luce riflessa →
+// il canale rosso pulsa al ritmo del cuore. Il motore PpgCapture filtra il
+// segnale e ne stima la FREQUENZA per autocorrelazione (robusta al rumore),
+// con una CONFIDENZA 0..1: se non c'è un vero battito periodico mostriamo "—"
+// invece di un numero a caso.
 //
-// Pipeline implementata:
-//   1) videoElement → drawImage su canvas off-screen (160×120, riduce CPU)
-//   2) per ogni frame, media del canale rosso su una ROI centrale
-//   3) filtro passa-banda 0.9 Hz – 4 Hz (≈54–240 bpm)
-//   4) peak detector normalizzato → battiti (intervalli RR)
-//   5) filtro outlier sugli RR + mediana mobile + gate di coerenza e smoothing
-//      → bpm stabile (mostrato solo se gli ultimi battiti sono consistenti)
-//
-// Limiti dichiarati:
-//   - torcia non accessibile da PWA su iOS: serve buona luce ambientale,
-//     oppure puntare verso una sorgente luminosa stabile.
-//   - mantenere il dito FERMO è essenziale: rumore di movimento >> segnale PPG.
+// Misurazione indicativa, NON a uso medico.
 // ============================================================================
 
 import { el, drawTrace } from '../utils.js';
 import { PpgCapture } from '../ppg.js';
 import { setMetric } from '../store.js';
 
-export function mount(container) {
-  // La cattura PPG (camera, filtro, picchi, qualità) è incapsulata in PpgCapture
-  // e condivisa con il modulo Stress. Qui consumiamo i campioni per stimare i bpm.
-  let capture = null;
+const CONF_SHOW = 0.40;   // confidenza minima per mostrare un numero
 
-  // Stima bpm robusta: gli intervalli RR passano un filtro outlier (range
-  // fisiologico + scarto dei salti bruschi da sfarfallio del dito / doppi
-  // conteggi), poi mediana su finestra mobile. Il numero si mostra solo quando
-  // gli ultimi battiti sono COERENTI (segnale davvero periodico) ed è smussato,
-  // così non salta 120→75→35. Altrimenti "—" (onesto: sta ancora misurando).
-  const recentRR = [];     // ultimi intervalli RR validi (ms)
-  let dispBpm = 0;         // bpm visualizzato, smussato (EMA)
-  let dbgFrames = 0, dbgT0 = 0, dbgLastShow = 0;   // DEBUG temporaneo: frame rate
-  const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
-  function pushRR(v) {
-    if (v < 333 || v > 1500) return;                 // fuori 40–180 bpm
-    if (recentRR.length >= 3) {
-      const m = median(recentRR);
-      if (Math.abs(v - m) / m > 0.30) return;        // scarta l'outlier (flicker/doppio conteggio)
-    }
-    recentRR.push(v);
-    if (recentRR.length > 8) recentRR.shift();
-  }
+export function mount(container) {
+  let capture = null;
+  let lastBpm = 0;        // ultimo bpm mostrato (salvato allo stop)
 
   // ---- UI ----
   const intro = el('div', { class: 'card' },
     el('h2', {}, 'Battito cardiaco (PPG)'),
-    el('p', {}, "Appoggia delicatamente il polpastrello dell'indice sulla fotocamera posteriore. Tieni fermo per circa 20 secondi. L'app analizza la luminosità del canale rosso, isola la componente cardiaca (0.9–4 Hz) e conta i picchi."),
+    el('p', {}, "Appoggia delicatamente il polpastrello dell'indice sulla fotocamera posteriore, coprendola del tutto, e tieni FERMO per ~20 secondi. La torcia, se disponibile, si accende da sola per un segnale più pulito."),
     el('div', { class: 'warning' },
       el('strong', {}, 'Misurazione indicativa, non uso medico. '),
-      "Usa un cardiofrequenzimetro o un saturimetro per misure affidabili. Su iPhone (iOS 17+) l'app può accendere la torcia per un segnale più pulito; dove non è disponibile servono buona luce ambientale e dito fermo."
+      "Per misure affidabili usa un cardiofrequenzimetro o un saturimetro. La stima compare solo quando il segnale è abbastanza periodico (vedi 'Qualità segnale')."
     ),
   );
 
   const startBtn = el('button', { class: 'btn', type: 'button' }, 'Attiva fotocamera');
   const stopBtn  = el('button', { class: 'btn secondary', type: 'button', disabled: true }, 'Stop');
-  // Toggle torcia: visibile solo se la fotocamera espone 'torch' (vedi onTorch).
   const torchBtn = el('button', { class: 'btn ghost hidden', type: 'button' }, '🔦 Torcia');
   const torchHint = el('p', { class: 'muted hidden', style: 'font-size:12px;margin-top:8px' },
-    'Torcia non disponibile su questo dispositivo (iPhone con iOS ≤16 o fotocamera senza flash): misura affidabile solo con buona luce ambientale e dito fermo.');
+    'Torcia non disponibile su questo dispositivo: serve buona luce ambientale e dito fermo.');
   const controls = el('div', { class: 'card' },
     el('div', { class: 'btn-row' }, startBtn, stopBtn),
     el('div', { style: 'margin-top:10px' }, torchBtn),
     torchHint,
     el('div', { class: 'kv', style: 'margin-top:12px' },
       el('dt', {}, 'Stato'),    el('dd', { id: 'hStatus' }, '—'),
-      el('dt', {}, 'Qualità'),  el('dd', { id: 'hQual' },   '—'),
-      el('dt', {}, 'Luce'),     el('dd', { id: 'hLight' },  '—'),
+      el('dt', {}, 'Dito'),     el('dd', { id: 'hLight' },  '—'),
     ),
   );
 
+  // Indicatore "Qualità segnale" = confidenza dell'autocorrelazione (onesto).
+  const qBar = el('div', { id: 'hQbar', style: 'height:100%;width:0%;border-radius:6px;background:var(--bad);transition:width .25s,background .25s' });
+  const qWrap = el('div', { style: 'height:10px;border-radius:6px;background:rgba(255,255,255,.08);overflow:hidden' }, qBar);
   const bpmCard = el('div', { class: 'card', style: 'text-align:center' },
     el('h3', {}, 'Frequenza cardiaca stimata'),
-    el('div', { class: 'metric', id: 'hBpmWrap', style: 'justify-content:center' },
-      el('span', { id: 'hBpm' }, '—'),
+    el('div', { class: 'metric', style: 'justify-content:center' },
+      el('span', { id: 'hBpm', style: 'font-size:64px;font-weight:700;line-height:1' }, '—'),
       el('span', { class: 'unit' }, 'bpm'),
+    ),
+    el('div', { style: 'margin-top:14px;text-align:left' },
+      el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:4px;display:flex;justify-content:space-between' },
+        el('span', {}, 'Qualità segnale'),
+        el('span', { id: 'hQpct' }, '—'),
+      ),
+      qWrap,
+      el('p', { id: 'hQhint', class: 'muted', style: 'font-size:12px;margin-top:8px' }, 'Attiva la fotocamera e appoggia il dito.'),
     ),
   );
 
   const canvas = el('canvas', { height: 140, 'aria-label': 'Onda PPG' });
   const graphCard = el('div', { class: 'card' },
-    el('h3', {}, 'Forma d\'onda PPG (filtrata)'),
+    el('h3', {}, "Forma d'onda PPG (filtrata)"),
     canvas,
-    el('p', { class: 'muted', style: 'font-size:12px;margin-top:8px' }, "Ogni picco corrisponde a una sistole. Se il segnale è piatto: il dito non copre la lente o c'è poca luce."),
-  );
-
-  // ---- DEBUG TEMPORANEO (da rimuovere appena la misura funziona) ----
-  // Serve a vedere il segnale reale sul device: livelli del canale rosso,
-  // ampiezza della componente cardiaca (AC), saturazione, frame rate effettivo
-  // e gli intervalli RR raccolti. È così che si capisce se "onda frastagliata"
-  // = rumore (AC alta ma irregolare), saturazione (R≈255) o frame duplicati.
-  const dbgPre = el('pre', { id: 'hDbg', style: 'white-space:pre-wrap;font-size:11px;margin:0;background:rgba(255,255,255,.04);padding:10px;border-radius:8px;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default' }, '— attiva e appoggia il dito —');
-  const dbgCard = el('div', { class: 'card' },
-    el('h3', {}, '🛠️ Debug temporaneo'),
-    el('p', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, 'Diagnostica provvisoria: incolla questi valori per chiudere il problema. Verrà rimossa.'),
-    dbgPre,
+    el('p', { class: 'muted', style: 'font-size:12px;margin-top:8px' }, "Ogni oscillazione regolare è un battito. Se è piatta o caotica: il dito non copre bene la lente, si muove, o c'è poca luce."),
   );
 
   container.appendChild(intro);
   container.appendChild(controls);
   container.appendChild(bpmCard);
   container.appendChild(graphCard);
-  container.appendChild(dbgCard);
 
   // ---- helpers UI ----
-  function setText(sel, txt) {
-    const n = container.querySelector(sel);
-    if (n) n.textContent = txt;
-  }
+  const setText = (sel, txt) => { const n = container.querySelector(sel); if (n) n.textContent = txt; };
   function setBadge(sel, label, cls) {
-    const n = container.querySelector(sel);
-    if (!n) return;
-    n.innerHTML = '';
-    n.appendChild(el('span', { class: `badge ${cls}` }, label));
+    const n = container.querySelector(sel); if (!n) return;
+    n.innerHTML = ''; n.appendChild(el('span', { class: `badge ${cls}` }, label));
   }
-  function setStatus(s, cls = '') { setBadge('#hStatus', s, cls); }
+  const setStatus = (s, cls = '') => setBadge('#hStatus', s, cls);
 
-  // ---- Consumo dei campioni PPG ----
-  // Per ogni frame aggiorniamo l'indicatore "dito/luce" e, sui picchi validi,
-  // alimentiamo il buffer RR filtrato. Il rendering del grafico e dei bpm qui.
+  // ---- Consumo dei campioni ----
   function onSample(s) {
-    setBadge('#hLight', s.fingerOk ? 'dito rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
-
-    // DEBUG TEMPORANEO: misura il frame rate effettivo e mostra i livelli reali.
-    dbgFrames++;
-    if (dbgT0 === 0) dbgT0 = s.ts;
-    if (s.ts - dbgLastShow > 1000) {
-      const hz = (dbgFrames * 1000 / (s.ts - dbgT0)) || 0;
-      const lastRR = recentRR.slice(-6).map(v => Math.round(v)).join(', ') || '—';
-      dbgPre.textContent =
-        `frame rate: ${hz.toFixed(1)} Hz   (atteso ~30)\n` +
-        `meanR=${s.meanR.toFixed(1)}  meanG=${s.meanG.toFixed(1)}  meanB=${s.meanB.toFixed(1)}\n` +
-        `saturazione R≥250: ${(s.satPct * 100).toFixed(1)}%${s.satPct > 0.5 ? '  ← CLIPPING' : ''}\n` +
-        `ampiezza AC (qualità): ${s.quality.toFixed(3)}   dito: ${s.fingerOk ? 'sì' : 'no'}\n` +
-        `RR raccolti: ${recentRR.length}/8   ultimi: [${lastRR}] ms\n` +
-        `bpm mostrato: ${dispBpm ? Math.round(dispBpm) : '—'}`;
-      dbgLastShow = s.ts;
-    }
-
-    if (s.fingerOk && s.isPeak && s.intervalMs > 0) pushRR(s.intervalMs);
-    // Dito assente per davvero: butta la storia, così al rientro si riparte pulito.
-    if (!s.fingerOk) { recentRR.length = 0; dispBpm = 0; }
-
+    setBadge('#hLight', s.fingerOk ? 'rilevato' : 'posiziona il dito', s.fingerOk ? 'ok' : 'warn');
     drawTrace(canvas, capture.filtered(), { color: '#ff5b6e' });
 
-    // Mostra il numero solo con abbastanza battiti COERENTI tra loro (segnale
-    // periodico): mediana + dispersione bassa. Altrimenti "—" (sta misurando).
-    let shown = '—';
-    if (s.fingerOk && recentRR.length >= 5) {
-      const m = median(recentRR);
-      const spread = (Math.max(...recentRR) - Math.min(...recentRR)) / m;
-      const bpm = 60000 / m;
-      if (spread < 0.35 && bpm >= 40 && bpm <= 200) {
-        dispBpm = dispBpm ? dispBpm * 0.8 + bpm * 0.2 : bpm;   // smoothing
-        shown = Math.round(dispBpm).toString();
-      } else if (dispBpm) {
-        shown = Math.round(dispBpm).toString();                // tieni l'ultimo stabile
-      }
+    // Barra qualità = confidenza (0..1). Verde alta, rossa bassa.
+    const conf = s.fingerOk ? (s.conf || 0) : 0;
+    const pct = Math.round(conf * 100);
+    const bar = container.querySelector('#hQbar');
+    if (bar) {
+      bar.style.width = `${Math.min(100, pct)}%`;
+      bar.style.background = conf >= 0.6 ? 'var(--ok)' : conf >= CONF_SHOW ? 'var(--accent)' : 'var(--bad)';
     }
-    setText('#hBpm', shown);
+    setText('#hQpct', s.fingerOk ? `${pct}%` : '—');
 
-    let qLbl, qCls;
-    if (!s.fingerOk)            { qLbl = 'in attesa'; qCls = ''; }
-    else if (s.quality < 0.2)  { qLbl = 'bassa';     qCls = 'bad'; }
-    else if (s.quality < 0.5)  { qLbl = 'media';     qCls = 'warn'; }
-    else                        { qLbl = 'buona';    qCls = 'ok'; }
-    setBadge('#hQual', qLbl, qCls);
+    // Numero: solo con dito e confidenza sufficiente. Il bpm è già mediato/smussato
+    // nel motore (aggiornato solo a confidenza decente).
+    const ok = s.fingerOk && conf >= CONF_SHOW && s.bpm >= 40 && s.bpm <= 200;
+    if (ok) { lastBpm = Math.round(s.bpm); setText('#hBpm', String(lastBpm)); }
+    else { setText('#hBpm', '—'); }
+
+    let hint;
+    if (!s.fingerOk) hint = 'Appoggia il polpastrello e copri tutta la lente.';
+    else if (conf < CONF_SHOW) hint = 'Segnale debole: tieni il dito FERMO e premi leggero, aspetta qualche secondo.';
+    else if (conf < 0.6) hint = 'Segnale acquisito — resta fermo per stabilizzare la misura.';
+    else hint = 'Segnale buono.';
+    setText('#hQhint', hint);
   }
 
-  // Stato torcia → mostra il toggle solo dove 'torch' è esposto, altrimenti
-  // mostra l'avviso onesto sull'affidabilità senza torcia.
   function onTorch({ available, on }) {
     if (available) {
       torchHint.classList.add('hidden');
@@ -190,16 +127,12 @@ export function mount(container) {
   }
 
   function resetTorchUI() {
-    torchBtn.classList.add('hidden');
-    torchBtn.classList.remove('ok');
-    torchHint.classList.add('hidden');
+    torchBtn.classList.add('hidden'); torchBtn.classList.remove('ok'); torchHint.classList.add('hidden');
   }
 
   async function start() {
     setStatus('richiesta fotocamera…', 'info');
-    recentRR.length = 0; dispBpm = 0;
-    dbgFrames = 0; dbgT0 = 0; dbgLastShow = 0;
-    setText('#hBpm', '—');
+    lastBpm = 0; setText('#hBpm', '—'); setText('#hQpct', '—');
     capture = new PpgCapture(onSample, onTorch);
     try {
       await capture.start();
@@ -208,19 +141,16 @@ export function mount(container) {
       setStatus('permesso negato o fotocamera non disponibile', 'bad');
       return;
     }
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    setStatus('attivo', 'ok');
+    startBtn.disabled = true; stopBtn.disabled = false;
+    setStatus('attivo — tieni il dito fermo', 'ok');
   }
 
   function stop() {
     if (capture) { capture.stop(); capture = null; }
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+    startBtn.disabled = false; stopBtn.disabled = true;
     resetTorchUI();
     setStatus('fermo', '');
-    // Salva l'ultimo bpm STABILE per gli anelli salute della Home.
-    if (dispBpm > 0) setMetric('hr', Math.round(dispBpm), 'bpm');
+    if (lastBpm > 0) setMetric('hr', lastBpm, 'bpm');
   }
 
   startBtn.addEventListener('click', start);
